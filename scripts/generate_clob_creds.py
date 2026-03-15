@@ -58,6 +58,14 @@ def main():
         funder=funder or None,
     )
 
+    # ── Patch Signer.sign to add 0x prefix (bug in py_clob_client 0.17.0) ───
+    from py_clob_client.signer import Signer as _Signer
+    _orig_sign = _Signer.sign
+    def _patched_sign(self, message_hash):
+        sig = _orig_sign(self, message_hash)
+        return sig if sig.startswith("0x") else "0x" + sig
+    _Signer.sign = _patched_sign
+
     # ── Step 1: test L1 auth by attempting to create an API key ───────────────
     logger.info("")
     logger.info("Step 1 — Testing L1 auth (attempting create_api_key) ...")
