@@ -2,12 +2,12 @@
 price_feed.py — Real-time and historical OHLCV price data.
 
 Priority order:
-  1. Polygon.io REST (if POLYGON_API_KEY set)
+  1. Massive.com REST (formerly Polygon.io — set POLYGON_API_KEY in .env)
   2. CCXT public endpoints (Binance, no key required)
   3. Fallback: raise UnsupportedAssetError (logged, never crashes caller)
 
 Assets are resolved DYNAMICALLY — no hardcoded whitelist.
-Any ticker that Binance or Polygon knows about will work.
+Any ticker that Binance or Massive knows about will work.
 Unknown tickers raise UnsupportedAssetError which callers catch and log.
 """
 
@@ -24,7 +24,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-POLYGON_BASE    = "https://api.polygon.io/v2"
+POLYGON_BASE    = "https://api.massive.com/v2"   # formerly api.polygon.io — same endpoint paths
 _CCXT_EXCHANGE  = None   # Binance — lazy singleton
 _CCXT_BYBIT     = None   # Bybit fallback — lazy singleton
 
