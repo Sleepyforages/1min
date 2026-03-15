@@ -132,34 +132,40 @@ class LiveExecutor:
             api_passphrase=cfg.api_passphrase,
         )
         funder = cfg.funder_address or None
-        # signature_type=1 = POLY_PROXY: required for Polymarket proxy/email wallets.
-        # The funder address is the proxy contract that holds USDC; the signer key
-        # signs on its behalf.  EOA wallets (signature_type=0) require manual
-        # on-chain ERC-20 approvals; proxy wallets have them pre-set by Polymarket.
-        sig_type = 1 if funder else 0
+        # sig_type=0 (EOA): the private key wallet IS the maker and holds USDC directly.
+        # sig_type=1 (POLY_PROXY): only when a separate proxy contract holds the funds
+        # and the signer is registered on-chain as its operator.
+        # With funder=None the signer address is used as maker (correct for direct EOA).
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,  # Polygon mainnet
             key=cfg.private_key,
             creds=creds,
-            funder=funder,
-            signature_type=sig_type,
+            funder=funder or None,
+            signature_type=0,
         )
-        # Force the CLOB server to re-read on-chain balances (clears stale cache)
+        # Log on-chain USDC balance (native USDC on Polygon: 0x3c499...)
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            self.client.update_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            bal = self.client.get_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            logger.info("CLOB balance after sync: %s", bal)
+            import requests as _req
+            USDC_N = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+            USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            wallet = self.client.signer.address()
+            def _onchain_bal(tok):
+                r = _req.post("https://polygon-bor-rpc.publicnode.com", json={
+                    "jsonrpc": "2.0", "method": "eth_call",
+                    "params": [{"to": tok, "data": "0x70a08231" + wallet[2:].zfill(64)}, "latest"],
+                    "id": 1,
+                }, timeout=8)
+                return int(r.json().get("result") or "0x0", 16) / 1e6
+            bal_n = _onchain_bal(USDC_N)
+            bal_e = _onchain_bal(USDC_E)
+            logger.info("On-chain USDC: native=%.4f  USDC.e=%.4f  wallet=%s",
+                        bal_n, bal_e, wallet)
         except Exception as exc:
-            logger.warning("Balance sync failed (non-fatal): %s", exc)
-        logger.info("LiveExecutor initialised  signer=%s  funder=%s  sig_type=%s",
+            logger.warning("On-chain balance check failed: %s", exc)
+        logger.info("LiveExecutor initialised  signer=%s  funder=%s  sig_type=0",
                     self.client.signer.address() if self.client.signer else "none",
-                    funder or "(same as signer)", sig_type)
+                    funder or "(same as signer)")
 
     def place_market_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
         """
