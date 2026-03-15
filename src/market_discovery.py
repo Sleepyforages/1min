@@ -1,13 +1,19 @@
 """
 market_discovery.py — Fetch active 5-min and 15-min "Up or Down" markets
-from the Polymarket Gamma API.
+from the Polymarket Gamma API (events endpoint).
 
 Market format on Polymarket (2026):
   "Bitcoin Up or Down - March 16, 10:45AM-10:50AM ET"
   Outcomes: ["Up", "Down"]  — clobTokenIds[0] = Up token, [1] = Down token
 
-The CLOB API (clob.polymarket.com) only returns legacy 2022-2023 markets.
-The Gamma API (gamma-api.polymarket.com) has current live markets.
+Data source:
+  Gamma EVENTS endpoint (gamma-api.polymarket.com/events) — has current/upcoming markets.
+  Gamma MARKETS endpoint is full of orphaned Dec-2025 zombie records; DO NOT USE IT.
+
+Window activation:
+  Markets are pre-created in Gamma 12-24h before the window opens.
+  CLOB only activates a market (order-book live, orders accepted) when the window starts.
+  We only return markets whose window start is ≤ 15 minutes away OR already started.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ class PolyMarket:
     up_token_id:   str   # clobTokenIds[0]
     down_token_id: str   # clobTokenIds[1]
     end_date_iso:  str
+    window_start_iso: str = ""   # computed: end - interval
     best_up_ask:   float = 0.0
     best_down_ask: float = 0.0
 
@@ -87,38 +94,39 @@ def _match_asset(question: str, assets: List[str]) -> Optional[str]:
     return None
 
 
-def _match_interval(question: str, slug: str, target: str) -> bool:
-    """Check if a market matches the target interval (5m or 15m)."""
+def _match_interval(title: str, slug: str, target: str) -> bool:
+    """Check if an event matches the target interval (5m or 15m)."""
     minutes = INTERVAL_MINUTES.get(target)
     if minutes is None:
         return False
     slug_lower = slug.lower()
-    q_lower    = question.lower()
-    # Slug check: "btc-updown-5m-..." or "btc-updown-15m-..."
+    # Slug pattern: "btc-updown-5m-..." or "btc-updown-15m-..."
     if f"-{minutes}m-" in slug_lower or f"updown-{minutes}m" in slug_lower:
         return True
-    # Question check: "10:45AM-10:50AM" (5-min span) or "10:45AM-11:00AM" (15-min)
-    # Fall back: just check "5m" / "15m" literal in slug
+    # Fallback: check literal in slug
     if f"{minutes}m" in slug_lower:
         return True
     return False
 
 
-# ── Gamma API ──────────────────────────────────────────────────────────────────
+# ── Gamma API (events endpoint) ────────────────────────────────────────────────
 
-def _fetch_gamma_page(offset: int = 0, limit: int = 100) -> list:
-    """Fetch one page of active, accepting-orders markets from the Gamma API."""
+def _fetch_gamma_events_page(offset: int = 0, limit: int = 100) -> list:
+    """Fetch one page of active events from the Gamma events endpoint.
+
+    The events endpoint (not /markets) has real current/upcoming intraday markets.
+    Sorted by endDate ascending so the nearest windows come first.
+    """
     params = {
-        "active":          "true",
-        "closed":          "false",
-        "accepting_orders": "true",
-        "limit":           limit,
-        "offset":          offset,
-        "order":           "endDate",
-        "ascending":       "true",
+        "active":    "true",
+        "closed":    "false",
+        "limit":     limit,
+        "offset":    offset,
+        "order":     "endDate",
+        "ascending": "true",
     }
-    logger.debug("Fetching Gamma markets offset=%d", offset)
-    resp = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=15)
+    logger.debug("Fetching Gamma events offset=%d", offset)
+    resp = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -128,10 +136,14 @@ def _fetch_gamma_page(offset: int = 0, limit: int = 100) -> list:
 def discover_markets(
     interval:  str = "5m",
     assets:    List[str] | None = None,
-    max_pages: int = 10,
+    max_pages: int = 5,
 ) -> List[PolyMarket]:
     """
-    Fetch active "Up or Down" markets from Polymarket Gamma API.
+    Fetch active "Up or Down" markets from the Polymarket Gamma events API.
+
+    Only returns markets whose trading window is currently open OR starts
+    within the next 15 minutes (CLOB activates order books at window open).
+
     Returns the nearest upcoming window per asset, direction agnostic
     (each PolyMarket holds both up_token_id and down_token_id).
     """
@@ -143,6 +155,11 @@ def discover_markets(
     # Keep only the soonest market per asset (sorted by endDate ascending)
     best: Dict[str, PolyMarket] = {}
 
+    interval_mins = INTERVAL_MINUTES.get(interval)
+    if interval_mins is None:
+        logger.error("Unknown interval '%s'", interval)
+        return []
+
     logger.info("Starting market discovery — interval=%s assets=%s", interval, assets_lower)
 
     offset = 0
@@ -151,88 +168,113 @@ def discover_markets(
 
     while pages < max_pages:
         try:
-            page_markets = _fetch_gamma_page(offset=offset, limit=limit)
+            page_events = _fetch_gamma_events_page(offset=offset, limit=limit)
         except Exception as exc:
-            logger.error("Gamma API fetch error on page %d: %s", pages, exc)
+            logger.error("Gamma events API fetch error on page %d: %s", pages, exc)
             break
 
-        if not page_markets:
-            logger.debug("No more markets returned — stopping at page %d", pages)
+        if not page_events:
+            logger.debug("No more events returned — stopping at page %d", pages)
             break
 
-        logger.debug("Page %d: %d raw markets", pages, len(page_markets))
+        logger.debug("Page %d: %d raw events", pages, len(page_events))
 
-        for m in page_markets:
-            question: str = m.get("question", "")
-            slug:     str = m.get("slug", "")
+        now = datetime.now(timezone.utc)
+
+        for event in page_events:
+            title: str = event.get("title", "")
+            slug:  str = event.get("slug",  "")
 
             # Must be an "Up or Down" market
-            if "up or down" not in question.lower():
+            if "up or down" not in title.lower():
                 continue
 
             # Must match the requested interval
-            if not _match_interval(question, slug, interval):
-                logger.debug("Skipping (wrong interval): %s [%s]", question[:80], slug)
+            if not _match_interval(title, slug, interval):
+                logger.debug("Skipping (wrong interval): %s [%s]", title[:80], slug)
                 continue
 
-            # Only trade windows that start within the next 15 minutes or have already started.
-            # This prevents the bot from grabbing tomorrow's pre-created markets which the
-            # CLOB rejects as "market not found" because they aren't funded/ready yet.
-            start_str = m.get("eventStartTime") or m.get("startDate", "")
-            end_str   = m.get("endDate", "")
-            now       = datetime.now(timezone.utc)
+            # Pull the embedded market record
+            markets_list = event.get("markets", [])
+            if not markets_list:
+                logger.debug("Event has no embedded markets: %s", title[:80])
+                continue
+            m = markets_list[0]
+
+            # Compute trading window start/end
+            # endDate in the market is the window END; start = end - interval
+            end_str = m.get("endDate", "") or event.get("endDate", "")
+            if not end_str:
+                logger.debug("No endDate for event: %s", title[:80])
+                continue
+
             try:
-                start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                end_dt   = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                window_open   = start_dt <= now + timedelta(minutes=15)
-                window_active = start_dt <= now <= end_dt
-                if not (window_open or window_active):
-                    logger.debug("Skipping future market (starts in >15min): %s", question[:80])
+                end_dt     = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                start_dt   = end_dt - timedelta(minutes=interval_mins)
+
+                # Only trade windows that are currently active OR open within next 15 min.
+                # "opens_soon"  = window hasn't started yet but is ≤15 min away.
+                # "active"      = window has started and hasn't ended yet.
+                # Past windows (start < now AND end < now) are excluded.
+                window_opens_soon = now <= start_dt <= now + timedelta(minutes=15)
+                window_active     = start_dt <= now <= end_dt
+
+                if not (window_opens_soon or window_active):
+                    logger.debug(
+                        "Skipping (window not imminent: starts %s, now %s): %s",
+                        start_dt.strftime("%H:%M"), now.strftime("%H:%M"), title[:80],
+                    )
                     continue
-            except (ValueError, AttributeError):
-                pass  # if dates can't be parsed, don't filter
+            except (ValueError, AttributeError) as exc:
+                logger.debug("Cannot parse endDate '%s' for %s: %s", end_str, title[:60], exc)
+                continue
 
             # Must match a configured asset
-            asset = _match_asset(question, assets_lower)
+            asset = _match_asset(title, assets_lower)
             if asset is None:
                 continue
 
-            # Extract token IDs from clobTokenIds (stored as JSON string)
+            # Extract token IDs from clobTokenIds (JSON string inside the market record)
             raw_tokens = m.get("clobTokenIds", "[]")
             try:
                 token_ids = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
             except (json.JSONDecodeError, TypeError):
-                logger.debug("Invalid clobTokenIds for: %s", question[:80])
+                logger.debug("Invalid clobTokenIds for: %s", title[:80])
                 continue
 
             if len(token_ids) < 2:
-                logger.debug("Missing token IDs for: %s", question[:80])
+                logger.debug("Missing token IDs for: %s", title[:80])
                 continue
 
             pm = PolyMarket(
                 condition_id=m.get("conditionId", ""),
-                question=question,
+                question=title,
                 asset=asset,
                 interval=interval,
                 up_token_id=token_ids[0],
                 down_token_id=token_ids[1],
-                end_date_iso=m.get("endDate", ""),
+                end_date_iso=end_str,
+                window_start_iso=start_dt.isoformat(),
             )
 
-            # Keep only the soonest window per asset
+            # Keep only the soonest window per asset (events are sorted endDate asc)
             if asset not in best:
                 best[asset] = pm
                 found_assets.add(asset)
-                logger.debug("Found market: [%s] %s (end=%s)", asset, question[:80], pm.end_date_iso)
+                logger.info(
+                    "Found market: [%s] %s  window=%s–%s UTC",
+                    asset, title[:60],
+                    start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M"),
+                )
             else:
-                logger.debug("Duplicate asset %s — keeping soonest, skipping: %s", asset, question[:60])
+                logger.debug("Duplicate asset %s — keeping soonest, skipping: %s", asset, title[:60])
 
-        # If we've found all requested assets, stop paging early
+        # Stop early if all requested assets found
         if found_assets >= set(assets_lower):
             logger.debug("All requested assets found — stopping early")
             break
 
-        if len(page_markets) < limit:
+        if len(page_events) < limit:
             break  # last page
 
         offset += limit
@@ -241,12 +283,11 @@ def discover_markets(
 
     markets = list(best.values())
 
-    # Warn about assets with no market
     missing = set(assets_lower) - found_assets
     for asset in missing:
         logger.warning(
-            "Asset '%s' is in config but has NO active %s Up/Down market on Polymarket "
-            "— it will be skipped this cycle.", asset, interval
+            "Asset '%s' has NO active %s Up/Down market opening within 15 min — "
+            "skipping this cycle.", asset, interval
         )
 
     logger.info(
