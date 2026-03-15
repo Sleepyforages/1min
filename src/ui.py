@@ -521,8 +521,9 @@ def tab_backtest(cfg: Config):
 
     col1, col2, col3 = st.columns(3)
     with col1:
+        _bt_options = sorted(set(cfg.assets) | {"btc", "eth", "sol", "xrp"})
         bt_assets = st.multiselect(
-            "Assets to test", ["btc", "eth", "sol", "xrp"], default=cfg.assets,
+            "Assets to test", _bt_options, default=cfg.assets,
             help="Only assets with a price feed can be backtested.",
         )
     with col2:
