@@ -27,9 +27,13 @@ open http://localhost:8501
 |---|---|
 | Markets | All active BTC / ETH / SOL / XRP 5-min or 15-min Up/Down binary markets |
 | Progression | Fixed, Martingale, Fibonacci, D'Alembert (UI dropdown) |
+| H1 momentum filter | Reads developing 1h candle; if body > 0.3%, locks direction + forces progression for ~12 trades |
 | Hedge mode | Buys both sides; sells hedge leg after configurable time/price trigger |
 | US-hours boost | Configurable stake multiplier during peak hours (default ×2) |
 | RSI filter | Skips overextended entries based on RSI(14) threshold |
+| Kelly sizing | Optional half-Kelly dynamic stake based on edge × bankroll |
+| Telegram alerts | Win/loss/drawdown notifications via bot token |
+| Parallel execution | All assets traded concurrently (one thread per asset per cycle) |
 | Weekend mode | Skip trading or allow momentum-only trades on weekends |
 | Paper trading | Full simulation — no real orders placed |
 | Live trading | Via py-clob-client (Polygon mainnet) |
@@ -104,6 +108,94 @@ after 3 losses → stake = $4, then win → $3, win → $2 …
 
 ---
 
+## H1 Momentum Filter
+
+The bot reads the **current developing 1h candle** (via CCXT 1h OHLCV) on every cycle and computes:
+
+```
+body_pct = abs(h1_close - h1_open) / h1_open
+```
+
+### Logic
+
+| Condition | Action |
+|---|---|
+| `body_pct >= h1_body_threshold` (default 0.3%) | Set directional bias = candle direction |
+| Bias is **up** and signal is **down** | Skip the trade (`h1_counter_trend`) |
+| Bias is **up** and signal is **up** | Allow trade + force `h1_force_progression` (default: martingale) |
+| Bias window expires after `h1_bias_duration_trades` (default 12) | Return to configured progression method |
+
+### Example
+
+```
+H1 candle: open=65000, current=65250 → body = 0.38% → bias = UP
+Next 12 five-minute cycles: only UP bets fire, progression forced to martingale
+After 12 trades (or if a new opposing H1 body forms): bias resets
+```
+
+### Config keys
+
+```yaml
+h1_filter_enabled: true
+h1_body_threshold: 0.003        # 0.3% minimum H1 body to trigger bias
+h1_bias_duration_trades: 12     # trades to ride the bias window
+h1_force_progression: martingale  # fixed | martingale | fibonacci | dalembert
+```
+
+### UI
+
+Sidebar → **H1 Momentum Filter** expander:
+- Toggle on/off
+- Body threshold slider (0.1–2.0%)
+- Bias duration slider (3–24 trades)
+- Force progression dropdown
+
+---
+
+## Kelly / Half-Kelly Sizing
+
+When enabled, replaces the static `base_bet_usd` with a dynamic stake:
+
+```
+f     = kelly_estimated_edge × kelly_fraction
+stake = f × kelly_bankroll_usd
+stake = min(stake, bankroll × kelly_max_bet_pct / 100)
+stake = max(stake, base_bet_usd)   # floor
+```
+
+```yaml
+kelly_sizing_enabled: false
+kelly_fraction: 0.5          # 0.5 = half-Kelly
+kelly_bankroll_usd: 100.0
+kelly_estimated_edge: 0.04   # 4% estimated edge
+kelly_max_bet_pct: 5.0       # never bet more than 5% of bankroll
+```
+
+**Example** — bankroll $100, edge 4%, half-Kelly:
+`f = 0.04 × 0.5 = 0.02 → stake = $2.00`
+
+---
+
+## Telegram Alerts
+
+Add to `.env`:
+```
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Enable in config:
+```yaml
+telegram_alerts_enabled: true
+telegram_alert_on_win: false    # optional, can be noisy
+telegram_alert_on_loss: true
+telegram_drawdown_alert_pct: 5.0
+```
+
+Alerts fire asynchronously (background thread) and never block the trading loop.
+
+---
+
 ## Config Reference
 
 ```yaml
@@ -111,18 +203,50 @@ mode: paper                  # live | paper | backtest
 interval: 5m                 # 5m | 15m
 assets: [btc, eth, sol, xrp]
 base_bet_usd: 1.0
+
+# Progression
 progression_type: fixed      # fixed | martingale | fibonacci | dalembert
-progression_cap: 7           # 3–7 (used only for progressive methods)
+progression_cap: 7
+
+# Hedge
 use_hedge: true
 hedge_sell_trigger_minutes: 2.5
 hedge_sell_price_trigger: 0.20
+
+# US-hours multiplier
 us_hours_multiplier: 2.0
 us_hours_start_utc: 14
 us_hours_end_utc: 20
+
+# RSI filter
 rsi_filter_enabled: true
 rsi_period: 14
 rsi_overextended_low: 45
 rsi_overextended_high: 55
+
+# H1 momentum filter
+h1_filter_enabled: true
+h1_body_threshold: 0.003        # 0.3% minimum H1 candle body
+h1_bias_duration_trades: 12     # trades to hold the H1 bias
+h1_force_progression: martingale
+
+# Kelly sizing
+kelly_sizing_enabled: false
+kelly_fraction: 0.5
+kelly_bankroll_usd: 100.0
+kelly_estimated_edge: 0.04
+kelly_max_bet_pct: 5.0
+
+# Telegram alerts
+telegram_alerts_enabled: false
+telegram_alert_on_win: false
+telegram_alert_on_loss: true
+telegram_drawdown_alert_pct: 5.0
+
+# Execution
+parallel_assets: true
+
+# Weekend / risk
 weekend_behavior: momentum_only   # skip | momentum_only
 dry_run: false
 max_daily_loss_pct: 10
@@ -167,14 +291,15 @@ POLYGON_API_KEY=...            # Optional — CCXT/Binance used as fallback
 ## Architecture
 
 ```
-ui.py          → Streamlit dashboard (config, backtest, monitor, logs)
-config.py      → YAML load/save + credential handling via env vars
+ui.py               → Streamlit dashboard (config, backtest, monitor, logs)
+config.py           → YAML load/save + credential handling via env vars
 market_discovery.py → CLOB API pagination, market matching
-price_feed.py  → OHLCV via Polygon.io or CCXT (Binance public)
-strategy.py    → Progression sizing, RSI filter, weekend filter, signal gen
-executor.py    → Paper ledger + live py-clob-client order placement
-backtester.py  → Vectorised simulation across all 4 methods
-bot.py         → Main loop, hot-reload, daily P&L reset
+price_feed.py       → OHLCV + H1 candle data via Polygon.io or CCXT
+strategy.py         → Progression sizing, H1 bias, Kelly sizing, RSI/weekend filters
+alerts.py           → Telegram fire-and-forget notifications
+executor.py         → Paper ledger + live py-clob-client order placement
+backtester.py       → Vectorised simulation across all 4 methods
+bot.py              → Main loop, parallel assets, hot-reload, daily P&L reset
 ```
 
 ---
