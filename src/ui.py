@@ -449,7 +449,8 @@ def tab_monitor(cfg: Config):
     mins, secs    = divmod(secs_left, 60)
 
     hour    = now_utc.hour
-    in_us   = cfg.us_hours_start_utc <= hour < cfg.us_hours_end_utc
+    weekday = now_utc.weekday()  # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    in_us   = (weekday < 5) and (cfg.us_hours_start_utc <= hour < cfg.us_hours_end_utc)
     running = (
         st.session_state.bot_process is not None
         and st.session_state.bot_process.poll() is None
