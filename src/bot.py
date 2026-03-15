@@ -70,8 +70,13 @@ class Bot:
             except Exception as exc:
                 logger.exception("Unhandled cycle error: %s", exc)
 
-            sleep_secs = INTERVAL_SECONDS.get(self.cfg.interval, 300)
-            logger.info("Cycle complete — sleeping %ds until next window", sleep_secs)
+            # Sleep until 2 seconds AFTER the next window boundary so we always
+            # enter at the very start of a fresh window (not mid-window).
+            interval_secs = INTERVAL_SECONDS.get(self.cfg.interval, 300)
+            now_ts = int(time.time())
+            next_boundary = ((now_ts + interval_secs) // interval_secs) * interval_secs
+            sleep_secs = max(1, next_boundary - now_ts + 2)
+            logger.info("Cycle complete — sleeping %ds until next window boundary", sleep_secs)
             for _ in range(sleep_secs):
                 if not self._running:
                     break

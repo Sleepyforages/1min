@@ -32,6 +32,7 @@ class Order:
     filled: bool = False
     fill_price: float = 0.0
     is_hedge: bool = False
+    token_size: float = 0.0   # number of tokens bought (size_usd / fill_price)
 
 
 @dataclass
@@ -138,19 +139,56 @@ class LiveExecutor:
         )
         logger.info("LiveExecutor initialised")
 
-    def place_market_buy(self, token_id: str, size_usd: float, price: float) -> str:
+    def place_market_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
+        """
+        Place a market buy order.
+        Returns (order_id, entry_price).
+        price=0 lets the CLOB calculate the best available price.
+        """
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=size_usd,
-            price=price,
+            price=price,   # 0 = auto-calculate from order book
         )
         signed_order = self.client.create_market_order(order_args)
         resp = self.client.post_order(signed_order, OrderType.FOK)
         order_id = resp.get("orderID", "unknown")
         logger.info("Live order placed: %s  response=%s", order_id, resp)
+        return order_id, price
+
+    def place_limit_sell(self, token_id: str, token_size: float, price: float) -> str:
+        """
+        Sell `token_size` tokens at `price` (GTC limit sell — used to close hedge).
+        """
+        from py_clob_client.clob_types import OrderArgs, OrderType, BUY, SELL
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=token_size,
+            side=SELL,
+        )
+        signed_order = self.client.create_order(order_args)
+        resp = self.client.post_order(signed_order, OrderType.GTC)
+        order_id = resp.get("orderID", "unknown")
+        logger.info("Hedge sell placed: %s  size=%.4f  price=%.3f", order_id, token_size, price)
         return order_id
+
+    def get_last_trade_price(self, token_id: str) -> float:
+        """Fetch last traded price from CLOB. Returns 0.5 on failure."""
+        import requests
+        try:
+            resp = requests.get("https://clob.polymarket.com/last-trade-price",
+                                params={"token_id": token_id}, timeout=5)
+            if resp.status_code == 200:
+                price_str = resp.json().get("price", "")
+                if price_str:
+                    return float(price_str)
+        except Exception:
+            pass
+        return 0.5
 
     def cancel_order(self, order_id: str) -> bool:
         try:
@@ -268,15 +306,36 @@ class Executor:
         if self.cfg.mode == "paper":
             self.paper.place_order(order)
         else:
-            order.order_id = self.live.place_market_buy(token_id, size_usd, price)
+            order.order_id, actual_price = self.live.place_market_buy(token_id, size_usd, price)
+            order.fill_price = actual_price if actual_price > 0 else (price if price > 0 else 0.5)
+            order.token_size = size_usd / order.fill_price if order.fill_price > 0 else 0.0
             order.filled = True
         return order
 
     def _close_hedge(self, hedge_order: Order):
-        """Called by timer to exit the hedge leg early."""
-        logger.info("Closing hedge leg %s", hedge_order.order_id)
+        """
+        Called by timer to exit the hedge leg early via a limit sell.
+        Fetches current last-trade price and places a GTC sell at that price.
+        (FOK cancel on a market order does nothing — the order is already filled.)
+        """
+        logger.info("Closing hedge leg %s  token=%s…", hedge_order.order_id, hedge_order.token_id[:16])
         if self.cfg.mode != "paper" and self.live:
-            self.live.cancel_order(hedge_order.order_id)
+            current_price = self.live.get_last_trade_price(hedge_order.token_id)
+            token_size = hedge_order.token_size
+            if token_size <= 0 and hedge_order.fill_price > 0:
+                token_size = hedge_order.size_usd / hedge_order.fill_price
+            if token_size > 0:
+                try:
+                    self.live.place_limit_sell(
+                        token_id=hedge_order.token_id,
+                        token_size=token_size,
+                        price=current_price,
+                    )
+                except Exception as exc:
+                    logger.error("Hedge sell failed for %s: %s", hedge_order.order_id, exc)
+            else:
+                logger.warning("Hedge order has no token_size — cannot sell, skipping close")
+
         # Mark in the parent position
         for pos in self.positions:
             if pos.hedge_order and pos.hedge_order.order_id == hedge_order.order_id:

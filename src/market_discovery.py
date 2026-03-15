@@ -251,26 +251,54 @@ def discover_markets(
     return markets
 
 
-def _get_best_ask(token_id: str) -> float:
-    """Fetch best ask price from CLOB /book endpoint. Returns 0.0 on failure."""
+def _get_entry_price(token_id: str) -> float:
+    """
+    Return the best available entry price for a token.
+
+    Priority:
+      1. Last traded price from /last-trade-price  — reflects actual fills
+      2. Best ask (lowest ask) from /book          — book is sorted worst-first,
+                                                     so best ask = asks[-1]
+      3. Default 0.5 (binary midpoint)
+
+    NOTE: The CLOB /book endpoint returns asks in DESCENDING order
+    (highest/worst price first), so asks[0] ≈ 0.99 and asks[-1] ≈ 0.60.
+    Using asks[0] was a bug — it read the worst possible ask, not the best.
+    """
     try:
-        resp = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=5)
+        # 1. Last traded price
+        resp = requests.get(f"{CLOB_BASE}/last-trade-price",
+                            params={"token_id": token_id}, timeout=5)
         if resp.status_code == 200:
-            asks = resp.json().get("asks", [])
+            price_str = resp.json().get("price", "")
+            if price_str:
+                price = float(price_str)
+                if 0.01 <= price <= 0.99:
+                    logger.debug("Last trade price for %s…: %.3f", token_id[:20], price)
+                    return price
+
+        # 2. Best ask = asks[-1] (book sorted worst-first)
+        resp2 = requests.get(f"{CLOB_BASE}/book",
+                             params={"token_id": token_id}, timeout=5)
+        if resp2.status_code == 200:
+            asks = resp2.json().get("asks", [])
             if asks:
-                return float(asks[0]["price"])
+                best_ask = float(asks[-1]["price"])  # last = lowest = best
+                logger.debug("Best ask for %s…: %.3f", token_id[:20], best_ask)
+                return best_ask
     except Exception as exc:
-        logger.debug("Best ask fetch failed for %s…: %s", token_id[:20], exc)
-    return 0.0
+        logger.debug("Entry price fetch failed for %s…: %s", token_id[:20], exc)
+
+    return 0.5   # binary midpoint default
 
 
 def enrich_with_prices(markets: List[PolyMarket], clob_client=None) -> List[PolyMarket]:
-    """Enrich markets with live ask prices from the CLOB /book endpoint."""
+    """Enrich markets with live entry prices (last trade or best ask)."""
     for m in markets:
         try:
-            m.best_up_ask   = _get_best_ask(m.up_token_id)
-            m.best_down_ask = _get_best_ask(m.down_token_id)
-            logger.debug("Prices for %s: up_ask=%.3f down_ask=%.3f",
+            m.best_up_ask   = _get_entry_price(m.up_token_id)
+            m.best_down_ask = _get_entry_price(m.down_token_id)
+            logger.debug("Prices for %s: up=%.3f down=%.3f",
                          m.asset, m.best_up_ask, m.best_down_ask)
         except Exception as exc:
             logger.warning("Price enrichment failed for %s: %s", m.condition_id, exc)
