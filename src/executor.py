@@ -174,10 +174,12 @@ class LiveExecutor:
         price=0 lets the CLOB calculate the best available price.
         """
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
 
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=size_usd,
+            side=BUY,
             price=price,        # 0 = auto-calculate from order book
             fee_rate_bps=1000,  # required by Polymarket: 10% taker fee
         )
@@ -191,7 +193,8 @@ class LiveExecutor:
         """
         Sell `token_size` tokens at `price` (GTC limit sell — used to close hedge).
         """
-        from py_clob_client.clob_types import OrderArgs, OrderType, BUY, SELL
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
 
         order_args = OrderArgs(
             token_id=token_id,
