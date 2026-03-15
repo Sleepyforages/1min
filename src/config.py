@@ -106,6 +106,16 @@ class Config:
     def api_passphrase(self) -> str:
         return os.getenv("POLYMARKET_API_PASSPHRASE", "")
 
+    @property
+    def funder_address(self) -> str:
+        """
+        Main wallet address (the one that holds USDC).
+        Set POLYMARKET_FUNDER_ADDRESS in .env if the private key is for a
+        proxy/operator wallet rather than the main EOA.
+        Leave unset if private key IS the main wallet.
+        """
+        return os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
     """Read YAML and return a Config dataclass. Falls back to defaults on missing keys."""

@@ -131,13 +131,17 @@ class LiveExecutor:
             api_secret=cfg.api_secret,
             api_passphrase=cfg.api_passphrase,
         )
+        funder = cfg.funder_address or None
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,  # Polygon mainnet
             key=cfg.private_key,
             creds=creds,
+            funder=funder,
         )
-        logger.info("LiveExecutor initialised")
+        logger.info("LiveExecutor initialised  signer=%s  funder=%s",
+                    self.client.signer.address() if self.client.signer else "none",
+                    funder or "(same as signer)")
 
     def place_market_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
         """
