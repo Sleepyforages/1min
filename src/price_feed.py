@@ -161,3 +161,32 @@ def get_rsi(asset: str, period: int = 14, interval: str = "5m") -> Optional[floa
     except Exception as exc:
         logger.error("RSI computation failed for %s: %s", asset, exc)
         return None
+
+
+def get_h1_data(asset: str) -> Optional[Dict[str, float]]:
+    """
+    Return the current H1 candle's open price and the latest close price,
+    plus the body percentage (abs(close - open) / open).
+
+    Uses the 1h timeframe; falls back to constructing from 5m bars if needed.
+    Returns None on error.
+    """
+    try:
+        exchange = _get_ccxt_exchange()
+        symbol = ASSET_TO_CCXT[asset]
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=2)
+        if not ohlcv:
+            return None
+        # Latest incomplete candle
+        _, h1_open, _, _, h1_close, _ = ohlcv[-1]
+        body_pct = abs(h1_close - h1_open) / h1_open if h1_open else 0.0
+        direction = "up" if h1_close > h1_open else "down"
+        return {
+            "h1_open": float(h1_open),
+            "h1_close": float(h1_close),
+            "body_pct": float(body_pct),
+            "direction": direction,
+        }
+    except Exception as exc:
+        logger.warning("H1 data fetch failed for %s: %s", asset, exc)
+        return None

@@ -35,6 +35,28 @@ rsi_period: 14
 rsi_overextended_low: 45     # Skip UP bets when RSI < this
 rsi_overextended_high: 55    # Skip DOWN bets when RSI > this
 
+# ── H1 Momentum Filter ────────────────────────────────────────────────────────
+h1_filter_enabled: true
+h1_body_threshold: 0.003     # Min H1 body % to trigger momentum bias (0.3%)
+h1_bias_duration_trades: 12  # How many 5-min trades to ride the H1 bias
+h1_force_progression: martingale  # Progression to use during H1 bias window
+
+# ── Kelly Sizing ───────────────────────────────────────────────────────────────
+kelly_sizing_enabled: false  # Replace fixed base_bet_usd with half-Kelly
+kelly_fraction: 0.5          # 0.5 = half-Kelly (safer)
+kelly_bankroll_usd: 100.0    # Total bankroll for Kelly calculations
+kelly_estimated_edge: 0.04   # Estimated edge (4% = realistic for filtered entries)
+kelly_max_bet_pct: 5.0       # Hard cap: never bet more than X% of bankroll
+
+# ── Telegram Alerts ────────────────────────────────────────────────────────────
+telegram_alerts_enabled: false
+telegram_alert_on_win: false
+telegram_alert_on_loss: true
+telegram_drawdown_alert_pct: 5.0  # Alert if drawdown exceeds X%
+
+# ── Parallel Execution ─────────────────────────────────────────────────────────
+parallel_assets: true        # Run all assets concurrently (thread per asset)
+
 # ── Weekend Behaviour ──────────────────────────────────────────────────────────
 weekend_behavior: momentum_only   # skip | momentum_only
 

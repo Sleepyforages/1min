@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .config import Config
-from .price_feed import get_rsi
+from .price_feed import get_h1_data, get_rsi
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ class ProgressionState:
     streak_losses: int = 0          # martingale: consecutive losses
     fib_step: int = 0               # fibonacci: current step index
     dalembert_units: float = 0.0    # dalembert: extra units above base
+    # H1 bias tracking
+    h1_bias_direction: Optional[str] = None   # "up" | "down" | None
+    h1_bias_trades_left: int = 0              # trades remaining in the bias window
 
 
 def _reset_state(state: ProgressionState) -> ProgressionState:
@@ -123,6 +126,71 @@ def _fibonacci_up_to(n: int) -> List[int]:
     return seq
 
 
+# ── Kelly sizing ──────────────────────────────────────────────────────────────
+
+def kelly_bet_size(cfg: Config) -> float:
+    """
+    Half-Kelly criterion:
+        f = (edge / odds) * kelly_fraction
+        stake = f * bankroll
+        capped at kelly_max_bet_pct % of bankroll
+
+    For binary markets where payout is ~$1 per $0.50 stake (odds ≈ 1.0):
+        f = edge * kelly_fraction
+    """
+    if not cfg.kelly_sizing_enabled:
+        return cfg.base_bet_usd
+
+    edge = cfg.kelly_estimated_edge          # e.g. 0.04
+    fraction = cfg.kelly_fraction            # e.g. 0.5  (half-Kelly)
+    bankroll = cfg.kelly_bankroll_usd
+
+    # Binary market assumed at 50/50 fair odds → odds = 1.0
+    f = edge * fraction
+    stake = round(f * bankroll, 2)
+
+    # Hard cap
+    max_stake = round(bankroll * cfg.kelly_max_bet_pct / 100, 2)
+    stake = min(stake, max_stake)
+
+    # Floor = base_bet_usd
+    return max(stake, cfg.base_bet_usd)
+
+
+# ── H1 momentum filter ────────────────────────────────────────────────────────
+
+def h1_get_bias(asset: str, cfg: Config, state: ProgressionState) -> Optional[str]:
+    """
+    Check the current H1 candle.  If body_pct > threshold, set a directional
+    bias for the next `h1_bias_duration_trades` trades and return that direction.
+    Returns the active bias direction (may be from a previous call), or None.
+    """
+    if not cfg.h1_filter_enabled:
+        return None
+
+    # Refresh bias from live H1 data
+    h1 = get_h1_data(asset)
+    if h1 and h1["body_pct"] >= cfg.h1_body_threshold:
+        new_dir = h1["direction"]
+        if new_dir != state.h1_bias_direction:
+            # New H1 bias window starts
+            state.h1_bias_direction = new_dir
+            state.h1_bias_trades_left = cfg.h1_bias_duration_trades
+            logger.info(
+                "H1 bias triggered for %s: %s (body=%.2f%%)",
+                asset, new_dir, h1["body_pct"] * 100,
+            )
+
+    # Count down bias window
+    if state.h1_bias_trades_left > 0:
+        state.h1_bias_trades_left -= 1
+        return state.h1_bias_direction
+
+    # Bias expired → reset
+    state.h1_bias_direction = None
+    return None
+
+
 # ── Multiplier layer ───────────────────────────────────────────────────────────
 
 def apply_multipliers(stake: float, cfg: Config) -> float:
@@ -183,6 +251,8 @@ class TradeSignal:
     stake_usd: float
     hedge_stake_usd: float  # 0 if use_hedge=False
     rsi_value: Optional[float] = None
+    h1_bias: Optional[str] = None       # active H1 bias direction, if any
+    progression_used: str = ""          # which progression was actually applied
     skipped: bool = False
     skip_reason: str = ""
 
@@ -197,29 +267,48 @@ def generate_signal(
 ) -> TradeSignal:
     """
     Produce a TradeSignal for one (asset, direction) pair.
-    Applies RSI, weekend, and progression logic.
+    Applies H1 bias, RSI, weekend, Kelly sizing, and progression logic.
     """
+    # Use a shared per-asset state key (not per-direction) for H1 bias
+    asset_state_key = f"{asset}_state"
+    asset_state = states.setdefault(asset_state_key, ProgressionState())
+
     asset_key = f"{asset}_{direction}"
-    state = states.setdefault(asset_key, ProgressionState())
+    dir_state = states.setdefault(asset_key, ProgressionState())
     last_result = last_results.get(asset_key, "none")
 
     # ── Weekend filter ────────────────────────────────────────────────────────
     if not weekend_allows_trade(direction, momentum_signal, cfg):
         return TradeSignal(asset, direction, 0, 0, skipped=True, skip_reason="weekend")
 
+    # ── H1 momentum filter ────────────────────────────────────────────────────
+    h1_bias = h1_get_bias(asset, cfg, asset_state)
+    if h1_bias is not None and h1_bias != direction:
+        # H1 candle is strongly trending the other way — skip this direction
+        return TradeSignal(asset, direction, 0, 0, h1_bias=h1_bias,
+                           skipped=True, skip_reason="h1_counter_trend")
+
     # ── RSI filter ────────────────────────────────────────────────────────────
     rsi_val = get_rsi(asset, period=cfg.rsi_period, interval=cfg.interval)
     if not rsi_allows_trade(asset, direction, cfg):
         return TradeSignal(asset, direction, 0, 0, rsi_value=rsi_val,
-                           skipped=True, skip_reason="rsi_filter")
+                           h1_bias=h1_bias, skipped=True, skip_reason="rsi_filter")
 
-    # ── Base stake from progression ───────────────────────────────────────────
+    # ── Determine active progression (H1 bias can force override) ────────────
+    active_progression = cfg.progression_type
+    if h1_bias == direction and cfg.h1_filter_enabled:
+        active_progression = cfg.h1_force_progression
+        logger.debug("H1 bias active for %s %s → forcing %s", asset, direction, active_progression)
+
+    # ── Base stake: Kelly or fixed/progressive ────────────────────────────────
+    base = kelly_bet_size(cfg)   # returns cfg.base_bet_usd if Kelly disabled
+
     raw_stake = calculate_next_bet_size(
-        base_bet_usd=cfg.base_bet_usd,
+        base_bet_usd=base,
         last_result=last_result,
-        progression_type=cfg.progression_type,
+        progression_type=active_progression,
         cap=cfg.progression_cap,
-        state=state,
+        state=dir_state,
     )
     stake = apply_multipliers(raw_stake, cfg)
 
@@ -232,4 +321,6 @@ def generate_signal(
         stake_usd=stake,
         hedge_stake_usd=hedge_stake,
         rsi_value=rsi_val,
+        h1_bias=h1_bias,
+        progression_used=active_progression,
     )

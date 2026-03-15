@@ -57,6 +57,28 @@ class Config:
     rsi_overextended_low: float = 45.0
     rsi_overextended_high: float = 55.0
 
+    # H1 momentum filter
+    h1_filter_enabled: bool = True
+    h1_body_threshold: float = 0.003
+    h1_bias_duration_trades: int = 12
+    h1_force_progression: str = "martingale"
+
+    # Kelly sizing
+    kelly_sizing_enabled: bool = False
+    kelly_fraction: float = 0.5
+    kelly_bankroll_usd: float = 100.0
+    kelly_estimated_edge: float = 0.04
+    kelly_max_bet_pct: float = 5.0
+
+    # Telegram alerts
+    telegram_alerts_enabled: bool = False
+    telegram_alert_on_win: bool = False
+    telegram_alert_on_loss: bool = True
+    telegram_drawdown_alert_pct: float = 5.0
+
+    # Parallel execution
+    parallel_assets: bool = True
+
     # Weekend
     weekend_behavior: WeekendBehavior = "momentum_only"
 

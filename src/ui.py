@@ -136,6 +136,81 @@ def render_sidebar() -> Config:
             disabled=not cfg.rsi_filter_enabled,
         )
 
+    with st.sidebar.expander("📉 H1 Momentum Filter"):
+        cfg.h1_filter_enabled = st.toggle("Enable H1 Filter", value=cfg.h1_filter_enabled)
+        cfg.h1_body_threshold = st.slider(
+            "H1 Body Threshold %", 0.1, 2.0,
+            float(cfg.h1_body_threshold * 100), 0.1,
+            disabled=not cfg.h1_filter_enabled,
+            help="Min H1 candle body size to trigger directional bias",
+        ) / 100
+        cfg.h1_bias_duration_trades = st.slider(
+            "Bias Duration (trades)", 3, 24,
+            int(cfg.h1_bias_duration_trades),
+            disabled=not cfg.h1_filter_enabled,
+        )
+        H1_PROG_OPTIONS = {
+            "Martingale": "martingale",
+            "Fibonacci": "fibonacci",
+            "D'Alembert": "dalembert",
+            "Fixed": "fixed",
+        }
+        h1_prog_label = st.selectbox(
+            "Force Progression During Bias",
+            list(H1_PROG_OPTIONS.keys()),
+            index=list(H1_PROG_OPTIONS.values()).index(cfg.h1_force_progression),
+            disabled=not cfg.h1_filter_enabled,
+        )
+        cfg.h1_force_progression = H1_PROG_OPTIONS[h1_prog_label]
+
+    with st.sidebar.expander("💰 Kelly Sizing"):
+        cfg.kelly_sizing_enabled = st.toggle("Enable Kelly Sizing", value=cfg.kelly_sizing_enabled,
+            help="Replaces fixed base_bet with dynamic half-Kelly stake")
+        cfg.kelly_fraction = st.slider(
+            "Kelly Fraction", 0.1, 1.0, float(cfg.kelly_fraction), 0.05,
+            disabled=not cfg.kelly_sizing_enabled,
+            help="0.5 = half-Kelly (recommended), 1.0 = full Kelly",
+        )
+        cfg.kelly_bankroll_usd = st.number_input(
+            "Bankroll (USD)", 10.0, 100000.0, float(cfg.kelly_bankroll_usd), 10.0,
+            disabled=not cfg.kelly_sizing_enabled,
+        )
+        cfg.kelly_estimated_edge = st.slider(
+            "Estimated Edge %", 0.5, 10.0,
+            float(cfg.kelly_estimated_edge * 100), 0.5,
+            disabled=not cfg.kelly_sizing_enabled,
+        ) / 100
+        cfg.kelly_max_bet_pct = st.slider(
+            "Max Bet % of Bankroll", 1.0, 10.0, float(cfg.kelly_max_bet_pct), 0.5,
+            disabled=not cfg.kelly_sizing_enabled,
+        )
+        if cfg.kelly_sizing_enabled:
+            kelly_stake = cfg.kelly_estimated_edge * cfg.kelly_fraction * cfg.kelly_bankroll_usd
+            kelly_stake = min(kelly_stake, cfg.kelly_bankroll_usd * cfg.kelly_max_bet_pct / 100)
+            st.caption(f"Next Kelly stake ≈ **${kelly_stake:.2f}**")
+
+    with st.sidebar.expander("🔔 Telegram Alerts"):
+        cfg.telegram_alerts_enabled = st.toggle("Enable Telegram Alerts", value=cfg.telegram_alerts_enabled)
+        cfg.telegram_alert_on_win = st.toggle("Alert on Win", value=cfg.telegram_alert_on_win,
+            disabled=not cfg.telegram_alerts_enabled)
+        cfg.telegram_alert_on_loss = st.toggle("Alert on Loss", value=cfg.telegram_alert_on_loss,
+            disabled=not cfg.telegram_alerts_enabled)
+        cfg.telegram_drawdown_alert_pct = st.slider(
+            "Drawdown Alert %", 1.0, 20.0, float(cfg.telegram_drawdown_alert_pct), 0.5,
+            disabled=not cfg.telegram_alerts_enabled,
+        )
+        if cfg.telegram_alerts_enabled:
+            import os
+            has_token = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
+            st.caption("Token: " + ("✅ set in .env" if has_token else "⚠️ missing — add to .env"))
+
+    with st.sidebar.expander("⚡ Execution"):
+        cfg.parallel_assets = st.toggle(
+            "Parallel Asset Execution",
+            value=cfg.parallel_assets,
+            help="Run all assets in parallel threads each cycle",
+        )
+
     with st.sidebar.expander("🗓 Weekend / Risk"):
         cfg.weekend_behavior = st.selectbox(
             "Weekend Behaviour",
@@ -217,23 +292,77 @@ def tab_controls(cfg: Config):
 
 def tab_monitor(cfg: Config):
     st.header("📡 Live Monitor")
-    st.info("Live monitor data is polled from in-memory state when bot is running in the same process. "
-            "In Docker the bot runs separately — check the Logs tab for real-time output.")
 
-    # Show paper balance from shared state (if available)
+    # ── Next-window countdown ─────────────────────────────────────────────────
+    from datetime import datetime, timezone
+    import math
+    now_utc = datetime.now(timezone.utc)
+    interval_secs = 300 if cfg.interval == "5m" else 900
+    secs_into_window = (now_utc.minute * 60 + now_utc.second) % interval_secs
+    secs_remaining = interval_secs - secs_into_window
+    mins, secs = divmod(secs_remaining, 60)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Next Window", f"{mins:02d}:{secs:02d}")
+    col2.metric("Interval", cfg.interval)
+    col3.metric("Mode", cfg.mode.upper())
+    col4.metric("Progression", cfg.progression_type.capitalize())
+
+    # US-hours indicator
+    hour = now_utc.hour
+    in_us = cfg.us_hours_start_utc <= hour < cfg.us_hours_end_utc
+    st.info(f"{'🇺🇸 US hours active — stakes ×' + str(cfg.us_hours_multiplier) if in_us else '🌙 Outside US hours — base stakes'}")
+
+    st.divider()
+
+    # ── Open positions (from paper ledger CSV if available) ───────────────────
     trades_path = ROOT / "data" / "paper_trades.csv"
     if trades_path.exists():
         df = pd.read_csv(trades_path)
-        st.subheader("Recent Trades")
-        st.dataframe(df.tail(50), use_container_width=True)
 
-        pnl_col = "pnl_usd" if "pnl_usd" in df.columns else None
-        if pnl_col:
-            cum_pnl = df[pnl_col].cumsum()
-            fig = px.line(cum_pnl, title="Cumulative P&L", labels={"value": "P&L (USD)"})
+        # Summary metrics
+        if "pnl_usd" in df.columns:
+            total_pnl = df["pnl_usd"].sum()
+            wins = (df["pnl_usd"] > 0).sum()
+            losses = (df["pnl_usd"] <= 0).sum()
+            win_rate = wins / len(df) * 100 if len(df) > 0 else 0
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total P&L", f"${total_pnl:.2f}", delta=f"${df['pnl_usd'].iloc[-1]:.2f}" if len(df) else "")
+            m2.metric("Win Rate", f"{win_rate:.1f}%")
+            m3.metric("Total Trades", len(df))
+            m4.metric("Wins / Losses", f"{wins} / {losses}")
+
+        # Cumulative P&L chart
+        if "pnl_usd" in df.columns and len(df) > 0:
+            cum_df = df.copy()
+            cum_df["cumulative_pnl"] = cum_df["pnl_usd"].cumsum()
+            fig = px.line(
+                cum_df, y="cumulative_pnl",
+                title="Cumulative P&L",
+                labels={"cumulative_pnl": "P&L (USD)", "index": "Trade #"},
+            )
+            fig.add_hline(y=0, line_dash="dash", line_color="gray")
             st.plotly_chart(fig, use_container_width=True)
+
+        # Per-asset breakdown
+        if "asset" in df.columns and "pnl_usd" in df.columns:
+            st.subheader("P&L by Asset")
+            asset_pnl = df.groupby("asset")["pnl_usd"].sum().reset_index()
+            fig2 = px.bar(asset_pnl, x="asset", y="pnl_usd", color="pnl_usd",
+                          color_continuous_scale="RdYlGn", title="P&L per Asset")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Recent Trades")
+        display_cols = [c for c in ["timestamp", "asset", "direction", "progression_used",
+                                     "h1_bias", "stake_usd", "pnl_usd", "outcome"] if c in df.columns]
+        st.dataframe(df[display_cols].tail(50), use_container_width=True)
+
     else:
         st.warning("No trade data yet. Start the bot in paper mode to generate data.")
+
+    if st.button("🔄 Refresh Monitor"):
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -344,6 +473,10 @@ def main():
         "🔬 Backtest",
         "📋 Logs",
     ])
+    # Auto-refresh every 30s when bot is running
+    running = st.session_state.bot_process is not None and st.session_state.bot_process.poll() is None
+    if running:
+        time.sleep(0)  # yields to Streamlit; real refresh driven by st.rerun below
     with tab1:
         tab_controls(cfg)
     with tab2:
