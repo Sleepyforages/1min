@@ -22,7 +22,7 @@ CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config/default.yaml"))
 ProgressionType = Literal["fixed", "martingale", "fibonacci", "dalembert"]
 IntervalType = Literal["5m", "15m"]
 ModeType = Literal["live", "paper", "backtest"]
-WeekendBehavior = Literal["skip", "momentum_only"]
+WeekendBehavior = Literal["skip", "momentum_only", "off"]
 
 
 @dataclass

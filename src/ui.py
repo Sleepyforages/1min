@@ -334,9 +334,9 @@ def render_sidebar() -> Config:
     with st.sidebar.expander("🗓 Weekend Behaviour"):
         cfg.weekend_behavior = st.selectbox(
             "Weekend Behaviour",
-            ["momentum_only", "skip"],
-            index=["momentum_only", "skip"].index(cfg.weekend_behavior),
-            help="skip = no trading on Sat/Sun | momentum_only = only trade when signal matches H1 direction",
+            ["momentum_only", "skip", "off"],
+            index=["momentum_only", "skip", "off"].index(cfg.weekend_behavior),
+            help="skip = no trading on Sat/Sun | momentum_only = only trade when H1 direction matches | off = trade always, skip CLOB liveness check",
         )
 
     if st.sidebar.button("💾 Save Config", type="primary",

@@ -87,7 +87,11 @@ class Bot:
         logger.info("━" * 60)
 
         logger.debug("Discovering %s markets for assets: %s", cfg.interval, cfg.assets)
-        markets = discover_markets(interval=cfg.interval, assets=cfg.assets)
+        markets = discover_markets(
+            interval=cfg.interval,
+            assets=cfg.assets,
+            skip_clob_check=(cfg.weekend_behavior == "off"),
+        )
         if not markets:
             logger.warning("No Polymarket markets found this cycle — nothing to trade")
             return

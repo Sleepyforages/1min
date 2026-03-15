@@ -144,6 +144,7 @@ def discover_markets(
     interval:  str = "5m",
     assets:    List[str] | None = None,
     max_pages: int = 5,   # kept for API compat, not used in slug approach
+    skip_clob_check: bool = False,
 ) -> List[PolyMarket]:
     """
     Discover active "Up or Down" markets for the CURRENT trading window.
@@ -214,8 +215,9 @@ def discover_markets(
             logger.warning("Missing token IDs for '%s'", slug)
             continue
 
-        # CLOB liveness check — confirms the market is live and accepting orders
-        if not _is_clob_live(token_ids[0]):
+        # CLOB liveness check — confirms the market is live and accepting orders.
+        # Skipped when weekend_behavior="off" so the bot can attempt trades any time.
+        if not skip_clob_check and not _is_clob_live(token_ids[0]):
             logger.warning(
                 "Asset '%s': CLOB not live for window %s–%s UTC "
                 "(weekend or market not yet activated). Skipping.",
