@@ -43,12 +43,19 @@ class Bot:
 
     def run(self):
         self._running = True
-        logger.info(
-            "Bot started — mode=%s interval=%s progression=%s hedge=%s parallel=%s",
-            self.cfg.mode, self.cfg.interval,
-            self.cfg.progression_type, self.cfg.use_hedge,
-            self.cfg.parallel_assets,
-        )
+        logger.info("=" * 60)
+        logger.info("BOT STARTING")
+        logger.info("  mode         = %s", self.cfg.mode)
+        logger.info("  interval     = %s", self.cfg.interval)
+        logger.info("  assets       = %s", self.cfg.assets)
+        logger.info("  progression  = %s (cap %d)", self.cfg.progression_type, self.cfg.progression_cap)
+        logger.info("  hedge        = %s", self.cfg.use_hedge)
+        logger.info("  kelly        = %s", self.cfg.kelly_sizing_enabled)
+        logger.info("  h1_filter    = %s (threshold %.3f)", self.cfg.h1_filter_enabled, self.cfg.h1_body_threshold)
+        logger.info("  rsi_filter   = %s", self.cfg.rsi_filter_enabled)
+        logger.info("  parallel     = %s", self.cfg.parallel_assets)
+        logger.info("  dry_run      = %s", self.cfg.dry_run)
+        logger.info("=" * 60)
         alert_bot_started(self.cfg)
 
         signal.signal(signal.SIGINT, self._shutdown)
@@ -56,14 +63,15 @@ class Bot:
 
         while self._running:
             try:
+                logger.debug("Hot-reloading config …")
                 self.cfg = load_config()
                 self._maybe_reset_daily_pnl()
                 self._run_cycle()
             except Exception as exc:
-                logger.exception("Cycle error: %s", exc)
+                logger.exception("Unhandled cycle error: %s", exc)
 
             sleep_secs = INTERVAL_SECONDS.get(self.cfg.interval, 300)
-            logger.debug("Sleeping %ds until next cycle", sleep_secs)
+            logger.info("Cycle complete — sleeping %ds until next window", sleep_secs)
             for _ in range(sleep_secs):
                 if not self._running:
                     break
@@ -73,32 +81,43 @@ class Bot:
 
     def _run_cycle(self):
         cfg = self.cfg
-        logger.info("=== Cycle start %s ===", datetime.now(timezone.utc).isoformat())
+        now = datetime.now(timezone.utc).isoformat()
+        logger.info("━" * 60)
+        logger.info("CYCLE START  %s", now)
+        logger.info("━" * 60)
 
+        logger.debug("Discovering %s markets for assets: %s", cfg.interval, cfg.assets)
         markets = discover_markets(interval=cfg.interval, assets=cfg.assets)
         if not markets:
-            logger.warning("No markets found — skipping cycle")
+            logger.warning("No Polymarket markets found this cycle — nothing to trade")
             return
 
         market_index: Dict[str, PolyMarket] = {
             f"{m.asset}_{m.direction}": m for m in markets
         }
+        logger.info("Active markets: %d", len(markets))
+        for m in markets:
+            logger.debug("  Market: [%s/%s] end=%s yes_ask=%.3f",
+                         m.asset, m.direction, m.end_date_iso, m.best_yes_ask)
 
         if cfg.mode == "live":
+            logger.debug("Enriching market prices from CLOB …")
             try:
                 enrich_with_prices(markets)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Price enrichment failed: %s", exc)
 
         if cfg.parallel_assets:
+            logger.debug("Running assets in parallel threads")
             self._run_assets_parallel(cfg, market_index)
         else:
+            logger.debug("Running assets sequentially")
             for asset in cfg.assets:
                 self._process_asset(cfg, asset, market_index)
 
-        # Drawdown alert after each cycle
         if self.executor.paper:
             dd = self._current_drawdown_pct()
+            logger.info("Daily P&L: $%.2f  |  Drawdown: %.1f%%", self.executor.daily_pnl, dd)
             alert_drawdown(dd, cfg)
 
     def _run_assets_parallel(self, cfg: Config, market_index: Dict[str, PolyMarket]):
@@ -117,40 +136,56 @@ class Bot:
             t.join(timeout=60)
 
     def _process_asset(self, cfg: Config, asset: str, market_index: Dict[str, PolyMarket]):
+        logger.debug("Processing asset: %s", asset)
         for direction in ["up", "down"]:
-            key = f"{asset}_{direction}"
+            key    = f"{asset}_{direction}"
             market = market_index.get(key)
             if not market:
+                logger.debug("  No active Polymarket for %s/%s — skipping", asset, direction)
                 continue
 
-            momentum_signal = direction  # real feeds used in live mode
+            logger.debug("  Generating signal for %s/%s …", asset, direction)
+            momentum_signal = direction
 
             with self._lock:
-                sig: TradeSignal = generate_signal(
-                    asset=asset,
-                    direction=direction,
-                    momentum_signal=momentum_signal,
-                    cfg=cfg,
-                    states=self.states,
-                    last_results=self.last_results,
-                )
+                try:
+                    sig: TradeSignal = generate_signal(
+                        asset=asset,
+                        direction=direction,
+                        momentum_signal=momentum_signal,
+                        cfg=cfg,
+                        states=self.states,
+                        last_results=self.last_results,
+                    )
+                except Exception as exc:
+                    logger.error("Signal generation error for %s/%s: %s", asset, direction, exc)
+                    continue
 
             if sig.skipped:
-                logger.debug("Skipped %s %s: %s", asset, direction, sig.skip_reason)
+                logger.info("  SKIP %s/%s — reason: %s  rsi=%.1f  h1_bias=%s",
+                            asset, direction, sig.skip_reason,
+                            sig.rsi_value or 0, sig.h1_bias or "none")
                 continue
 
-            hedge_key = f"{asset}_{'down' if direction == 'up' else 'up'}"
-            hedge_market = market_index.get(hedge_key)
+            logger.info("  SIGNAL %s/%s  stake=$%.2f  hedge=$%.2f  prog=%s  rsi=%.1f  h1=%s",
+                        asset, direction, sig.stake_usd, sig.hedge_stake_usd,
+                        sig.progression_used, sig.rsi_value or 0, sig.h1_bias or "none")
 
-            pos = self.executor.execute_signal(sig, market, hedge_market)
+            hedge_key    = f"{asset}_{'down' if direction == 'up' else 'up'}"
+            hedge_market = market_index.get(hedge_key)
+            if cfg.use_hedge and not hedge_market:
+                logger.warning("  Hedge market not found for %s/%s — placing main leg only",
+                               asset, direction)
+
+            try:
+                pos = self.executor.execute_signal(sig, market, hedge_market)
+            except Exception as exc:
+                logger.error("  Order execution error for %s/%s: %s", asset, direction, exc)
+                continue
+
             if pos:
-                logger.info(
-                    "Opened %s %s $%.2f (hedge=$%.2f) prog=%s h1=%s",
-                    asset, direction, sig.stake_usd, sig.hedge_stake_usd,
-                    sig.progression_used, sig.h1_bias or "none",
-                )
-                # Simulated settlement (paper mode): settle immediately as win/loss
-                # based on next-bar direction — in live mode this is async/on-chain
+                logger.info("  OPENED position id=%s %s/%s $%.2f",
+                            pos.main_order.order_id, asset, direction, sig.stake_usd)
                 if cfg.mode == "paper":
                     self._paper_settle(pos, cfg)
 
