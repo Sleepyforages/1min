@@ -1,0 +1,337 @@
+{
+  "audit_type": "CC — Code Correctness & Technical Audit",
+  "date": "2026-03-15",
+  "auditor": "Claude CC Auditor",
+  "overall_rating": "4/10",
+  "executive_summary": "The bot has a sound architectural skeleton — modular files, config dataclass, paper/live routing, thread-per-asset parallelism — but contains multiple critical and high-severity defects that make live trading non-functional today. The CLOB 401 is driven by at least two compounding root causes (API credential derivation workflow and a likely incorrect eip712_structs shim). Beyond the auth blocker, there are serious correctness issues: hedge 'close' calls cancel() on an already-filled market order (which always no-ops), positions accumulate unboundedly in memory, the daily-loss guard is broken in live mode, the RSI function calls get_rsi() twice per signal wasting latency, the hedge_sell_trigger timer is not cancelled on bot shutdown and fires across restarts into stale state, and window-timestamp arithmetic has an off-by-one that causes the bot to look up the wrong market during the final second of any window. Security posture is acceptable for credentials-at-rest (env vars, no YAML leak), but the Streamlit dashboard exposes an unauthenticated HTTP port at 0.0.0.0 with no network restriction, which on a public VPS is a critical exposure. The eip712_structs shim uses a star-import with no __all__ guard, which may silently shadow or omit symbols needed for EIP-712 signing. Addressing CC-001 through CC-005 is the minimum required to attempt live trading.",
+
+  "findings": [
+    {
+      "id": "CC-001",
+      "severity": "critical",
+      "category": "api_integration",
+      "file": "src/executor.py",
+      "line_range": "141-153",
+      "title": "CLOB 401: MarketOrderArgs price field is not a recognised parameter in py-clob-client 0.17",
+      "description": "LiveExecutor.place_market_buy() constructs MarketOrderArgs(token_id, amount, price). In py-clob-client 0.17 the MarketOrderArgs dataclass accepts only token_id and amount; the price field does not exist. Passing an unexpected keyword argument either raises a TypeError at runtime (before any network call) or, if the library silently ignores it, the signed order is built with a zero/default price field causing the CLOB to reject it with 401/400. This is distinct from, but compounds with, the wallet-registration issue described in CC-002.",
+      "recommendation": "Verify the exact signature of MarketOrderArgs for py-clob-client==0.17.0 by inspecting the installed package (clob_types.py). If price is not a valid field, remove it. The amount field in a market order is denominated in USDC, not shares — confirm units match the CLOB spec. Validate by calling client.get_order_book() first to confirm the client is auth-compatible before placing orders.",
+      "code_snippet": "order_args = MarketOrderArgs(\n    token_id=token_id,\n    amount=size_usd,\n    price=price,   # <-- likely invalid kwarg for 0.17\n)\nsigned_order = self.client.create_market_order(order_args)\nresp = self.client.post_order(signed_order, OrderType.FOK)"
+    },
+    {
+      "id": "CC-002",
+      "severity": "critical",
+      "category": "api_integration",
+      "file": "src/executor.py + Dockerfile",
+      "line_range": "executor.py:124-139, Dockerfile:16-22",
+      "title": "CLOB 401: eip712_structs shim star-import may silently produce wrong EIP-712 hashes",
+      "description": "The Dockerfile creates a shim package 'eip712_structs' whose sole content is 'from poly_eip712_structs import *'. If poly_eip712_structs does not define __all__, the star-import exports everything in its namespace at shim-creation time, but any symbol that py_clob_client imports by explicit name (e.g. 'from eip712_structs import EIP712Struct, Address') will resolve to the shim's re-exported names only if they exist in poly_eip712_structs under the same name. Polymarket's fork may have renamed, removed, or restructured classes. If any class is missing, Python raises ImportError at runtime. If a class is present but structurally different (different encode() semantics), EIP-712 digests are computed incorrectly and every signed order is rejected with 401 'Invalid L1 Request headers'. Additionally, the shim is created only during docker build — it is not present in local dev environments, causing auth to fail locally even with valid credentials.",
+      "recommendation": "Audit poly_eip712_structs exports against what py_clob_client actually imports from eip712_structs. Use explicit re-exports in the shim rather than star-import (e.g., 'from poly_eip712_structs import EIP712Struct, Address, Uint, etc.'). Add a build-time test that imports ClobClient and calls a read-only method (get_sampling_simplified_markets) to validate the shim before the image is pushed.",
+      "code_snippet": "(shim / '__init__.py').write_text('from poly_eip712_structs import *\\n')"
+    },
+    {
+      "id": "CC-003",
+      "severity": "critical",
+      "category": "api_integration",
+      "file": "docs/INFRASTRUCTURE.md",
+      "line_range": "237-266",
+      "title": "CLOB 401: wallet not registered — API credentials must be derived AFTER on-chain registration",
+      "description": "Polymarket's CLOB uses a two-layer auth model: L1 is an EIP-712 signature over each request using the wallet's private key, and L2 is an HMAC using API credentials that must be explicitly derived via create_or_derive_api_creds() after the wallet has interacted with Polymarket's on-chain contracts (at minimum, the CTF Exchange approval). If the wallet at 0xB7253d998bC266e1d2031BbF4AbD7f771d5e9D32 has never called setApprovalForAll on the CTF Exchange or if API credentials were generated from a different key/nonce, all signed requests return 401 'Unauthorized/Invalid api key' regardless of signing correctness. The INFRASTRUCTURE.md documents this as 'unknown' root cause, but the described symptoms are entirely consistent with an unregistered wallet. The current code has no pre-flight registration check.",
+      "recommendation": "1. Using a browser wallet, navigate to polymarket.com and complete the onboarding with the target wallet address. This triggers the necessary on-chain approvals. 2. After registration, call ClobClient(...).create_or_derive_api_creds() once to generate fresh L2 credentials. 3. Store the resulting api_key, api_secret, api_passphrase in .env. 4. Add a startup health-check in LiveExecutor.__init__() that calls self.client.get_ok() and raises a clear ConfigError if it fails, so the bot exits immediately instead of attempting orders with invalid creds.",
+      "code_snippet": "# From INFRASTRUCTURE.md — correct derivation sequence:\n# ClobClient(host, chain_id=137, key=private_key).create_or_derive_api_creds()\n# This must be run AFTER wallet is registered on Polymarket"
+    },
+    {
+      "id": "CC-004",
+      "severity": "critical",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "275-284",
+      "title": "Hedge 'close' calls cancel() on a filled market order — always a no-op",
+      "description": "_close_hedge() calls self.live.cancel_order(hedge_order.order_id). A market order placed with OrderType.FOK (Fill-Or-Kill) is either immediately fully filled or immediately cancelled by the exchange. If the order filled, its order_id refers to a completed fill; cancel() on a filled order returns an error (the CLOB rejects cancellation of filled orders). If FOK was rejected (not filled), the position was never opened, so there is nothing to close. In either case, the cancel call in _close_hedge() never achieves its intended purpose of exiting the hedge leg mid-window. The actual mechanism for 'selling' a binary option position early on Polymarket is to place a SELL limit order on the same token, not to cancel the original buy.",
+      "recommendation": "Replace cancel_order() in _close_hedge() with a sell order: call place_market_sell(token_id, shares_held, current_bid_price) if such a method exists, or construct a GTC limit sell order at a price equal to or below the current best bid. The hedge_order object must store the number of shares received (size_usd / fill_price) so the correct quantity can be sold. The hedge_sell_price_trigger field in config is currently unused and should drive this sell price.",
+      "code_snippet": "def _close_hedge(self, hedge_order: Order):\n    logger.info('Closing hedge leg %s', hedge_order.order_id)\n    if self.cfg.mode != 'paper' and self.live:\n        self.live.cancel_order(hedge_order.order_id)  # BUG: no-op on filled FOK order"
+    },
+    {
+      "id": "CC-005",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/market_discovery.py",
+      "line_range": "89-98",
+      "title": "Window timestamp off-by-one: bot looks up the NEXT window when run at the exact boundary",
+      "description": "_current_window_end_ts() computes ((now_ts + interval_secs) // interval_secs) * interval_secs. When now_ts is exactly a multiple of interval_secs (i.e., the clock is exactly at a window boundary), this formula adds a full interval and returns the END of the next window, not the current one. For a 5-minute interval, if the bot wakes at exactly T=:00:00 it will look up the market ending at :05 rather than the market that just started at :00 (ending at :05 — which is actually correct). However, if the bot wakes at T=:04:59 it correctly finds the :05 market. At T=:05:00 it finds the :10 market. This means within the first second of a new window the bot targets the NEXT window's slug, which does not yet exist in Gamma, resulting in a missed trade for that cycle. The fencepost is off by one interval_secs in the boundary case.",
+      "recommendation": "Change the formula to: ceil_ts = ((now_ts - 1) // interval_secs + 1) * interval_secs — or equivalently use math.ceil(now_ts / interval_secs) * interval_secs with integer arithmetic. This correctly returns the current window end when called at the exact boundary second. Add a unit test covering now_ts == window_end_ts exactly.",
+      "code_snippet": "def _current_window_end_ts(interval_mins: int) -> int:\n    now_ts = int(time.time())\n    interval_secs = interval_mins * 60\n    # BUG: when now_ts % interval_secs == 0, adds a full extra interval\n    return ((now_ts + interval_secs) // interval_secs) * interval_secs"
+    },
+    {
+      "id": "CC-006",
+      "severity": "high",
+      "category": "concurrency",
+      "file": "src/bot.py",
+      "line_range": "127-140, 150-183",
+      "title": "Parallel asset threads share states/last_results dict under a single lock with nested blocking I/O inside the lock",
+      "description": "In _run_assets_parallel(), one thread per asset is spawned. Each thread calls _process_asset(), which holds self._lock for the entire duration of generate_signal(). generate_signal() calls get_h1_data() and get_rsi() — both are network calls to CCXT/Binance that can take 1-5 seconds. With N=8 assets, threads queue behind the lock and execute serially despite the parallel design intent. The actual concurrency gain is zero. Worse, if any network call hangs (e.g., Binance rate limit with a long timeout), the lock is held for the full timeout duration, blocking all other asset threads.",
+      "recommendation": "Move the lock scope to cover only the mutation of the shared state dict, not the network I/O. Refactor generate_signal() to accept pre-fetched RSI and H1 data so the lock guards only the read/write of ProgressionState objects. Alternatively, use per-asset locks (one RLock per asset key) instead of a single global lock.",
+      "code_snippet": "with self._lock:   # held during network calls to Binance\n    sig: TradeSignal = generate_signal(\n        asset=asset, direction=direction, ...\n    )  # get_h1_data() + get_rsi() called inside here"
+    },
+    {
+      "id": "CC-007",
+      "severity": "high",
+      "category": "concurrency",
+      "file": "src/executor.py",
+      "line_range": "224-228, 275-284",
+      "title": "hedge_sell_trigger timer fires into stale state after bot restart; timer threads leak on shutdown",
+      "description": "Each execute_signal() call starts a threading.Timer(N*60, self._close_hedge, args=(hedge_order,)). The timer holds a reference to the Executor object and its positions list. If the bot is restarted (SIGTERM followed by a new process), the old timer thread is a daemon=False timer (threading.Timer uses daemon=False by default), meaning it will prevent the Python interpreter from exiting cleanly. More critically, if the bot restarts and a new Executor is created, the old timer fires into the old Executor's positions list — which is now orphaned — does nothing useful, and then silently exits. There is no timer cancellation on shutdown, no persistence of pending timers, and no recovery on restart. A bot that restarts mid-window will have hedge positions that are never closed.",
+      "recommendation": "Store all active Timer objects in a list on the Executor. In a shutdown() method (called from Bot._shutdown), iterate and cancel them all. For true restart-safety, persist pending hedge close events (asset, token_id, close_at_utc) to a JSON file in /app/data and reload them on startup. Set daemon=True on hedge timers so they do not block interpreter exit.",
+      "code_snippet": "threading.Timer(\n    self.cfg.hedge_sell_trigger_minutes * 60,\n    self._close_hedge,\n    args=(hedge_order,),\n).start()  # no reference stored, cannot be cancelled"
+    },
+    {
+      "id": "CC-008",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "169, 237",
+      "title": "positions list grows unbounded — memory leak over long runs",
+      "description": "Every executed signal appends a Position to self.executor.positions (executor.py:237). Positions are never removed from this list. In paper mode the bot processes up to 16 asset-direction pairs per 5-minute cycle (8 assets × 2 directions). Over 24 hours that is 16 × 288 = 4,608 Position objects per day. Each Position holds two Order objects plus floats and strings. This is small per object but the list is also linearly scanned by _close_hedge() (line 282) on every hedge timer fire, making that operation O(N) where N grows without bound. On the 512 MB VPS, this will not OOM in normal operation, but over weeks/months of continuous running the list will contain hundreds of thousands of entries and linear scans will become measurably slow.",
+      "recommendation": "After settle() marks pos.resolved=True, remove it from self.positions (or move it to a separate resolved_positions deque with a maximum length). In _close_hedge(), use a dict keyed by order_id rather than a linear scan: self._hedge_positions: Dict[str, Position] = {}.",
+      "code_snippet": "with self._lock:\n    self.positions.append(pos)  # never pruned\n\n# Later in _close_hedge():\nfor pos in self.positions:   # O(N) linear scan over unbounded list\n    if pos.hedge_order and pos.hedge_order.order_id == hedge_order.order_id:"
+    },
+    {
+      "id": "CC-009",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "286-293",
+      "title": "Daily loss guard is always disabled in live mode",
+      "description": "_daily_loss_exceeded() only evaluates the loss condition when cfg.mode == 'paper' and self.paper is not None. In live mode it always returns False, meaning the max_daily_loss_pct config setting has no effect in production. This is the single most important risk control for a live trading bot and it is silently bypassed.",
+      "recommendation": "Track daily P&L in live mode by accumulating the USD value of orders placed (as a proxy for exposure) or by querying the CLOB for filled order history. At minimum, track the sum of stake_usd placed on the current UTC day and enforce the loss limit against that figure. The daily_pnl attribute on Executor already exists — it just is not updated from live fills.",
+      "code_snippet": "def _daily_loss_exceeded(self) -> bool:\n    if self.cfg.mode == 'paper' and self.paper:  # live mode always skips this\n        ...\n    return False  # always False in live mode"
+    },
+    {
+      "id": "CC-010",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/strategy.py",
+      "line_range": "292-295",
+      "title": "get_rsi() called twice per signal — double API cost and possible value inconsistency",
+      "description": "In generate_signal(), get_rsi() is called once inside rsi_allows_trade() (line 215 of strategy.py) and then again directly at line 292 to populate sig.rsi_value. Each call fetches OHLCV from Binance (one HTTP round-trip) and recomputes RSI. In parallel mode with 8 assets × 2 directions = 16 concurrent calls, this doubles all Binance API requests for RSI. More subtly, if the two calls straddle a candle close, they may return different RSI values — the logged rsi_value in the TradeSignal may not be the value that was used for the filter decision.",
+      "recommendation": "Compute RSI once at the start of generate_signal(), pass the value into rsi_allows_trade() as a parameter rather than having it re-fetch internally.",
+      "code_snippet": "# Line 215 inside rsi_allows_trade() — first fetch:\nrsi = get_rsi(asset, period=cfg.rsi_period, interval=cfg.interval)\n\n# Line 292 in generate_signal() — second independent fetch:\nrsi_val = get_rsi(asset, period=cfg.rsi_period, interval=cfg.interval)"
+    },
+    {
+      "id": "CC-011",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/bot.py",
+      "line_range": "64-73",
+      "title": "Config hot-reload replaces self.cfg but Executor keeps a stale reference",
+      "description": "At the start of each cycle, bot.run() does self.cfg = load_config() (line 67). This replaces the Bot's cfg reference. However, Executor was constructed with the original cfg object (bot.py:37) and stores it as self.cfg. The Executor never receives the new Config. All config values read by Executor methods (cfg.mode, cfg.use_hedge, cfg.hedge_sell_trigger_minutes, cfg.max_daily_loss_pct, cfg.dry_run) will use the stale config from bot construction for the lifetime of the process. Similarly, the cfg passed into _run_cycle() (line 83) is the fresh one, but execute_signal() uses self.cfg internally. UI config changes that affect executor behavior (bet sizing toggles, daily loss pct, dry_run) will silently have no effect.",
+      "recommendation": "Pass the current cfg to execute_signal() as a parameter and use that parameter rather than self.cfg, or add an update_config(cfg) method to Executor that replaces its stored reference at the start of each cycle.",
+      "code_snippet": "# bot.py:67\nself.cfg = load_config()   # Bot.cfg updated\n\n# bot.py:37 (constructor)\nself.executor = Executor(cfg)   # Executor stores original cfg — never updated\n\n# executor.py:193\nif self.cfg.dry_run:   # always reads original cfg"
+    },
+    {
+      "id": "CC-012",
+      "severity": "high",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "210-222",
+      "title": "Hedge always uses the same market object as the main leg — hedge_market argument is ignored in semantics",
+      "description": "execute_signal() accepts a hedge_market parameter, but bot.py always passes the same market object for both: self.executor.execute_signal(sig, market, market) (bot.py:180). The hedge leg therefore buys the OPPOSITE direction token from the SAME market object. This is actually correct for Polymarket binary Up/Down markets (one market has both Up and Down tokens), but the hedge_market parameter adds confusion and is misleading. More critically, the hedge direction logic at line 213 picks hedge_market.down_token_id when signal.direction=='up', which is correct. But if a caller ever passes a different market object as hedge_market (e.g., a different interval), the hedge would be placed on the wrong market. The API surface is error-prone.",
+      "recommendation": "Remove the hedge_market parameter. Since both legs are always the same binary market, derive the hedge token from market directly. Add an assertion or guard: assert hedge_market is market or hedge_market is None.",
+      "code_snippet": "# bot.py:180\npos = self.executor.execute_signal(sig, market, market)  # both args same object\n\n# executor.py:213\nhedge_token = hedge_market.down_token_id if signal.direction == 'up' else hedge_market.up_token_id"
+    },
+    {
+      "id": "CC-013",
+      "severity": "high",
+      "category": "security",
+      "file": "docker-compose.yml",
+      "line_range": "7-8",
+      "title": "Streamlit dashboard exposed on 0.0.0.0:8501 with no authentication on a public VPS",
+      "description": "The docker-compose.yml binds port 8501 to all interfaces (0.0.0.0). The Streamlit UI includes a 'Start Bot' button and a config editor that can change mode from 'paper' to 'live', modify API credentials paths, and alter bet sizes. Anyone who can reach the VPS IP on port 8501 (publicly routable at 89.167.101.87) can start/stop the bot, modify trading parameters, and view live P&L — all without any authentication. Streamlit has no built-in auth. The private key is not directly accessible via the UI, but an attacker can trigger live trades by switching mode and starting the bot.",
+      "recommendation": "1. Bind the port to localhost only: '127.0.0.1:8501:8501' and access via SSH tunnel. 2. Alternatively, add a reverse proxy (nginx/Caddy) with HTTP Basic Auth in front of port 8501. 3. Set POLYMARKET_PRIVATE_KEY as a Docker secret rather than an env_file entry. 4. Add a Streamlit authentication library (streamlit-authenticator) if public access is required.",
+      "code_snippet": "ports:\n  - '8501:8501'   # bound to 0.0.0.0 — publicly accessible"
+    },
+    {
+      "id": "CC-014",
+      "severity": "medium",
+      "category": "error_handling",
+      "file": "src/executor.py",
+      "line_range": "141-153",
+      "title": "No retry or fallback when CLOB API is unreachable during order placement",
+      "description": "place_market_buy() makes two sequential network calls: create_market_order() (local signing) and post_order() (HTTP to CLOB). If the CLOB is down or returns a 5xx error, the exception propagates up through _place_order() to execute_signal() and is caught by the broad except in bot.py:182, logging an error and continuing. The position is never opened, but the progression state (streak_losses, fib_step) was already mutated by calculate_next_bet_size() inside generate_signal() — so the bot treats a network failure as a trade that happened and advances the martingale/fibonacci sequence without an actual bet.",
+      "recommendation": "Move progression state mutation to AFTER successful order confirmation. Or, on network failure in _place_order(), reset the state back to its pre-call value. At minimum, catch requests.exceptions.ConnectionError and py_clob_client exceptions separately from other errors so they can be retried with exponential backoff (1-2 retries) before giving up.",
+      "code_snippet": "# generate_signal() mutates state:\nraw_stake = calculate_next_bet_size(..., state=dir_state)  # state mutated here\n\n# If post_order() later throws, state has already advanced:\nresp = self.client.post_order(signed_order, OrderType.FOK)  # can throw"
+    },
+    {
+      "id": "CC-015",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "82-116",
+      "title": "Paper settle double-counts hedge cost when hedge_closed=False",
+      "description": "settle_position() returns the main leg's principal (main.size_usd) to the balance via self.balance += pnl + main.size_usd (line 107). If a hedge order exists and hedge_closed is False, it also returns the hedge principal (line 109). However, the pnl variable already accounts for the hedge outcome (lines 101-104) — win: adds payout minus cost, loss: subtracts cost. Then line 109 adds back the hedge's full size_usd unconditionally. For a losing hedge leg, this means the balance is credited size_usd (the refund) despite pnl already having deducted it. The net effect is that losing hedge legs are refunded when they should not be, overstating the paper balance.",
+      "recommendation": "The hedge principal refund on line 109 is redundant with the pnl calculation. Remove line 109 (self.balance += pos.hedge_order.size_usd). The pnl calculation already encodes both win (net profit credited) and loss (cost already deducted). The main leg principal refund on line 107 is correct since place_order() deducted it.",
+      "code_snippet": "with self._lock:\n    self.balance += pnl + main.size_usd\n    if pos.hedge_order and not pos.hedge_closed:\n        self.balance += pos.hedge_order.size_usd  # BUG: double-refund for losing hedge"
+    },
+    {
+      "id": "CC-016",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/strategy.py",
+      "line_range": "183-191",
+      "title": "H1 bias counter decrements even when the trade is ultimately skipped by RSI filter",
+      "description": "In generate_signal(), h1_get_bias() is called first and decrements state.h1_bias_trades_left (line 187 of strategy.py) unconditionally. If the subsequent RSI filter then skips the trade (returning early with skipped=True), the H1 bias window has been consumed by a trade that never happened. Over time, this causes the H1 bias duration to expire faster than the configured h1_bias_duration_trades, making the H1 momentum system undercount the trades it is supposed to influence.",
+      "recommendation": "Only decrement h1_bias_trades_left when a trade is actually executed. Either move the decrement into generate_signal() after confirming all filters pass, or return the bias without side-effects and decrement it in a post-signal hook.",
+      "code_snippet": "# h1_get_bias() always decrements:\nif state.h1_bias_trades_left > 0:\n    state.h1_bias_trades_left -= 1   # decremented even if RSI later skips the trade\n    return state.h1_bias_direction"
+    },
+    {
+      "id": "CC-017",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/price_feed.py",
+      "line_range": "174-191",
+      "title": "UnsupportedAssetError from Polygon short-circuits fallback to CCXT",
+      "description": "In fetch_ohlcv(), the loop iterates over [(_fetch_polygon, 'Polygon'), (_fetch_ccxt, 'CCXT')]. When Polygon raises UnsupportedAssetError (e.g., for an asset not listed on Polygon), the handler does 'last_exc = exc; continue' — which correctly falls through to CCXT. However, when Polygon returns HTTP 403 or 429, raise_for_status() raises requests.exceptions.HTTPError, which is caught by the generic 'except Exception' branch at line 189 and also continues. This means 403/429 errors (which are the current production state per INFRASTRUCTURE.md) add extra latency for every RSI call (timeout waiting for Polygon before falling through). More critically, if Polygon returns 404 for a known asset, the code raises UnsupportedAssetError prematurely and CCXT is still tried — but if Polygon returns UnsupportedAssetError for the WRONG reason (e.g., API quota exhausted returns a JSON error body that the code misparses as 'no data'), the asset is incorrectly blacklisted.",
+      "recommendation": "Add a fast-path: if POLYGON_API_KEY is empty or the last Polygon call returned 403/429, skip Polygon entirely for subsequent calls within the same cycle (use a module-level flag with a TTL). This eliminates the Polygon timeout on every call and reduces RSI latency from ~15s to ~1s.",
+      "code_snippet": "for fetch_fn, name in [(_fetch_polygon, 'Polygon'), (_fetch_ccxt, 'CCXT')]:\n    try:\n        df = fetch_fn(asset, interval, limit)\n        return df\n    except UnsupportedAssetError as exc:\n        last_exc = exc\n        continue   # falls to CCXT — correct\n    except PriceFeedError as exc:   # 403/429 hits here — adds Polygon timeout to every call\n        last_exc = exc\n        continue"
+    },
+    {
+      "id": "CC-018",
+      "severity": "medium",
+      "category": "concurrency",
+      "file": "src/price_feed.py",
+      "line_range": "56-66",
+      "title": "Global CCXT exchange singletons are shared across parallel threads without locking",
+      "description": "_CCXT_EXCHANGE and _CCXT_BYBIT are module-level globals initialised lazily. When parallel_assets=True, multiple threads call _get_ccxt_exchange() simultaneously. There is a classic TOCTOU race: two threads both see _CCXT_EXCHANGE is None, both create ccxt.binance() instances, and both assign to the global. This creates two separate Binance clients with independent rate-limit state, potentially doubling the effective request rate and triggering 429s. Additionally, ccxt.Exchange.load_markets() modifies the exchange object's internal market cache — concurrent calls to load_markets() on a shared unsynchronised object may corrupt its state.",
+      "recommendation": "Use a threading.Lock to guard the lazy initialisation, or initialise both exchange objects at module import time (outside any function) so there is no race.",
+      "code_snippet": "def _get_ccxt_exchange() -> ccxt.Exchange:\n    global _CCXT_EXCHANGE\n    if _CCXT_EXCHANGE is None:            # TOCTOU race with parallel threads\n        _CCXT_EXCHANGE = ccxt.binance({'enableRateLimit': True})\n    return _CCXT_EXCHANGE"
+    },
+    {
+      "id": "CC-019",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/strategy.py",
+      "line_range": "162-191",
+      "title": "H1 bias state shared between 'up' and 'down' directions but progression state is per-direction",
+      "description": "generate_signal() uses two separate state keys: asset_state_key = f'{asset}_state' for H1 bias (shared across both directions) and asset_key = f'{asset}_{direction}' for progression (per direction). The H1 bias is correctly shared — one H1 candle applies to both directions for the asset. However, h1_get_bias() mutates the shared state's h1_bias_trades_left counter once per call. When parallel_assets=True, the 'up' and 'down' direction threads both call h1_get_bias() for the same asset concurrently, potentially decrementing the counter twice per cycle instead of once, halving the effective bias window.",
+      "recommendation": "Since both directions for an asset are processed sequentially within the same thread (_process_asset iterates ['up', 'down']), this is only a race in parallel mode. Ensure that the H1 bias check is performed once per asset (not once per direction) and the result is passed to both direction signal calls. Or use the per-asset lock to serialise the h1_get_bias() call.",
+      "code_snippet": "# Called twice per asset cycle (once for 'up', once for 'down'):\nh1_bias = h1_get_bias(asset, cfg, asset_state)  # decrements shared counter each call\n\n# asset_state is the SAME object for both 'up' and 'down' directions of the same asset"
+    },
+    {
+      "id": "CC-020",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/bot.py",
+      "line_range": "211-219",
+      "title": "_maybe_reset_daily_pnl() fires the daily-limit alert on EVERY cycle on day 1",
+      "description": "_last_reset_day is initialised to None (bot.py:41). On the very first cycle of any day, the condition _last_reset_day != today is True, and if dd > 0 the daily-limit alert fires before any trades have been placed (it fires based on the previous day's drawdown, which is 0.0 at startup). More critically, every time the bot process is restarted intra-day, _last_reset_day resets to None, triggering the reset logic again — calling reset_daily_pnl() mid-day zeroes the daily P&L accumulator, disabling loss-limit protection for the rest of the day.",
+      "recommendation": "Persist _last_reset_day and the daily P&L to the data/ directory so they survive restarts. At minimum, initialise _last_reset_day to datetime.now(timezone.utc).day at construction time so restarts within the same day do not trigger a false reset.",
+      "code_snippet": "self._last_reset_day: Optional[int] = None  # resets to None on every process restart\n\ndef _maybe_reset_daily_pnl(self):\n    today = datetime.now(timezone.utc).day\n    if self._last_reset_day != today:   # True on every restart, zeroing loss accumulator"
+    },
+    {
+      "id": "CC-021",
+      "severity": "medium",
+      "category": "correctness",
+      "file": "src/market_discovery.py",
+      "line_range": "200-204",
+      "title": "First market in event's markets[] array assumed to be the correct Up/Down market",
+      "description": "After fetching the Gamma event by slug, the code picks mkt_list[0] unconditionally. If the Gamma API returns an event with multiple markets (e.g., the event was edited or has sub-markets), the wrong market may be selected. The clobTokenIds would then correspond to a different resolution condition, and Up/Down token assignments could be reversed or invalid.",
+      "recommendation": "After selecting mkt_list[0], validate that the market's question or outcomes match the expected 'Up or Down' format. Assert len(token_ids) == 2 and optionally verify that the market's outcome labels are ['Up', 'Down'] (Gamma includes outcome names in the market object). Log a warning if mkt_list length > 1.",
+      "code_snippet": "mkt_list = event.get('markets', [])\nif not mkt_list:\n    continue\nm = mkt_list[0]   # assumes first market is always the correct one"
+    },
+    {
+      "id": "CC-022",
+      "severity": "medium",
+      "category": "security",
+      "file": "src/config.py",
+      "line_range": "94-96",
+      "title": "private_key property raises KeyError on missing env var — crashes bot at first credential access",
+      "description": "The private_key property uses os.environ['POLYMARKET_PRIVATE_KEY'] (dict-style access), which raises KeyError if the variable is not set. This is intentional for fail-fast behavior, but the error propagates as an unhandled KeyError deep inside LiveExecutor.__init__ rather than producing a clear configuration error message. Other credential properties (api_key, api_secret, api_passphrase) use os.getenv() and return empty strings silently, which may allow the ClobClient to be constructed with empty credentials and then fail later with cryptic CLOB errors.",
+      "recommendation": "Add a validate_credentials() function called at bot startup that checks all four credential env vars are non-empty and raises a descriptive ConfigError with actionable guidance. In particular, empty api_key, api_secret, or api_passphrase should be treated as fatal in live mode, not silently allowed to propagate to the CLOB.",
+      "code_snippet": "@property\ndef private_key(self) -> str:\n    return os.environ['POLYMARKET_PRIVATE_KEY']   # KeyError if missing\n\n@property\ndef api_key(self) -> str:\n    return os.getenv('POLYMARKET_API_KEY', '')    # silently empty — CLOB auth fails later"
+    },
+    {
+      "id": "CC-023",
+      "severity": "low",
+      "category": "correctness",
+      "file": "src/strategy.py",
+      "line_range": "131-157",
+      "title": "Kelly formula uses static kelly_bankroll_usd from config, not the actual paper balance",
+      "description": "kelly_bet_size() reads cfg.kelly_bankroll_usd, which is a fixed value from the YAML config. In paper mode, the actual balance changes with every trade. After a significant drawdown, Kelly sizing should reduce stake sizes automatically (fractional Kelly property), but because the bankroll figure is static, the stake remains constant regardless of actual balance. This means Kelly sizing provides no downside protection — it is equivalent to fixed sizing with a different formula.",
+      "recommendation": "Pass the current paper balance (executor.paper.balance) to kelly_bet_size() or to generate_signal(), and use that as the bankroll denominator. If live mode, use a configurable initial_bankroll_usd that the user updates periodically.",
+      "code_snippet": "bankroll = cfg.kelly_bankroll_usd   # static config value, ignores actual P&L"
+    },
+    {
+      "id": "CC-024",
+      "severity": "low",
+      "category": "correctness",
+      "file": "src/executor.py",
+      "line_range": "195-208",
+      "title": "main_price falls back to 0.5 when best_up_ask/best_down_ask is 0.0 — may place at wrong price",
+      "description": "execute_signal() uses main_price = market.best_up_ask if direction=='up' else market.best_down_ask, then passes price=main_price or 0.5 to _place_order(). The 'or 0.5' fallback triggers when best_up_ask is 0.0, which happens when enrich_with_prices() was skipped (paper mode) or when the CLOB returned an empty order book. For a market order this price hint is advisory, but if it is used in MarketOrderArgs.price (as currently coded), sending price=0.5 to a market whose real ask is $0.97 will cause the FOK order to be rejected because the limit price is below the current ask.",
+      "recommendation": "Before placing a live order, verify that best_up_ask/best_down_ask is > 0 and within a reasonable range (0.01 to 0.99). If 0.0 is returned, re-fetch the price directly from the CLOB /book endpoint. Do not use a hardcoded 0.5 fallback for live orders.",
+      "code_snippet": "main_price = market.best_up_ask if signal.direction == 'up' else market.best_down_ask\n...\nprice=main_price or 0.5,   # 0.5 fallback used in live mode when price fetch failed"
+    },
+    {
+      "id": "CC-025",
+      "severity": "low",
+      "category": "performance",
+      "file": "src/price_feed.py",
+      "line_range": "247-258",
+      "title": "get_h1_data() calls load_markets() on every invocation — redundant for established connections",
+      "description": "get_h1_data() calls ex.load_markets() inside the exchange-selection loop every time it is called. CCXT's load_markets() fetches and parses the full exchange market list (hundreds of symbols). Binance's market list is stable and load_markets() caches it after the first call, but calling it unconditionally in a hot path (once per asset per cycle) adds unnecessary overhead and a redundant conditional check on each call. With 8 assets this is 8 load_markets() calls per cycle even though the result is cached.",
+      "recommendation": "Call load_markets() once at exchange initialisation time (in _get_ccxt_exchange() and _get_bybit()) and store the result. Use exchange.markets directly in subsequent calls.",
+      "code_snippet": "for ex in [_get_ccxt_exchange(), _get_bybit()]:\n    try:\n        mkts = ex.load_markets()   # full round-trip on every H1 call per asset"
+    },
+    {
+      "id": "CC-026",
+      "severity": "low",
+      "category": "correctness",
+      "file": "src/bot.py",
+      "line_range": "191-207",
+      "title": "_paper_settle() uses a hardcoded 52% win probability disconnected from any market signal",
+      "description": "Paper settle simulates outcome with random.random() < 0.52 — a fixed probability regardless of the RSI, H1 bias, progression type, or any other signal. This makes paper mode P&L misleading: the strategy signals have no effect on paper outcomes. A trader validating a strategy in paper mode would see the same 52% win rate regardless of whether the filters are configured correctly, making paper mode useful only for testing execution mechanics, not strategy quality.",
+      "recommendation": "This is a known limitation appropriate for a paper mode stub, but it should be prominently documented so users do not mistake paper P&L for strategy validation. Alternatively, use the backtester for strategy validation and reserve paper mode for execution-path testing only. Document this limitation in the UI.",
+      "code_snippet": "outcome = pos.main_order.direction if random.random() < 0.52 else ..."
+    },
+    {
+      "id": "CC-027",
+      "severity": "info",
+      "category": "api_integration",
+      "file": "src/executor.py",
+      "line_range": "150",
+      "title": "OrderType.FOK is correct for market orders on Polymarket CLOB but has fill-or-cancel semantics that need handling",
+      "description": "post_order(signed_order, OrderType.FOK) is the documented way to place a market order on the Polymarket CLOB. FOK (Fill-Or-Kill) means the order must be fully filled immediately or it is cancelled. This is correct for the use case. However, the response handling only checks resp.get('orderID', 'unknown') and logs it — it does not check whether the order was actually filled (status field) or was killed due to insufficient liquidity. An FOK kill returns a different status (typically 'cancelled' or no fill) but is not distinguished from a successful fill in the current code. In live mode, the bot would record a filled Position for an order that was actually cancelled.",
+      "recommendation": "After post_order(), inspect the response for a status field indicating whether the FOK was filled or killed. Polymarket CLOB responses typically include 'status': 'matched' for fills. Raise an exception or return None if status != 'matched' so the caller knows the order was not executed.",
+      "code_snippet": "resp = self.client.post_order(signed_order, OrderType.FOK)\norder_id = resp.get('orderID', 'unknown')   # does not check fill status"
+    },
+    {
+      "id": "CC-028",
+      "severity": "info",
+      "category": "correctness",
+      "file": "src/market_discovery.py",
+      "line_range": "220",
+      "title": "CLOB liveness check uses only up_token_id — down token could be on a different status",
+      "description": "_is_clob_live() checks only token_ids[0] (the Up token). If the Up token's order book returns 200 but the Down token's book returns 404 (an edge case during market activation sequencing), the market would be added to the active list with an invalid Down token. Subsequent Down direction trades would silently fail.",
+      "recommendation": "Check liveness for both token_ids[0] and token_ids[1] and require both to return 200 before considering the market live.",
+      "code_snippet": "if not skip_clob_check and not _is_clob_live(token_ids[0]):\n    # token_ids[1] (Down token) is not checked"
+    }
+  ],
+
+  "positive_observations": [
+    "Credentials are exclusively sourced from environment variables and never written to YAML — the save_config() function explicitly skips all credential keys, preventing accidental credential leakage via the config file.",
+    "The slug-based market discovery approach is efficient and correct — O(n_assets) Gamma API calls with no pagination, directly targeting the current window timestamp.",
+    "The docker-compose.yml includes security_opt: no-new-privileges:true and resource limits (512m RAM, 1.0 CPU), showing awareness of container hardening.",
+    "Error handling in the main bot loop correctly uses a broad except with logger.exception() so unhandled cycle errors are fully logged with stack traces and the bot continues rather than crashing.",
+    "The PaperLedger uses a threading.Lock on all balance mutations, preventing paper balance corruption under parallel execution.",
+    "The price_feed module has a clean three-layer fallback (Polygon → Binance → Bybit) with proper exception chaining and distinct exception types (UnsupportedAssetError vs PriceFeedError) that allow callers to distinguish between 'asset unknown' and 'transient failure'.",
+    "The Executor correctly implements dry_run mode as a pre-trade gate before any order or paper ledger interaction, making it safe to test the entire pipeline without side effects.",
+    "The Config dataclass field filtering in load_config() (filtering only known fields) prevents YAML injection of unexpected parameters and makes the hot-reload safe against config file corruption with extra keys.",
+    "The Wilder RSI implementation using EWM with alpha=1/period and adjust=False is mathematically correct for Wilder smoothing.",
+    "The CLOB liveness pre-check before trading elegantly handles the weekend/after-hours case without requiring separate schedule logic — markets that are not accepting orders simply don't return 200."
+  ],
+
+  "top_3_priorities": [
+    "CC-001 + CC-002 + CC-003 (CLOB 401 root cause cluster): The bot cannot place any live order until all three auth issues are resolved in sequence. First: register the wallet on polymarket.com. Second: re-derive API credentials with create_or_derive_api_creds(). Third: audit the eip712_structs shim for missing symbols and add a startup health-check that calls a read-only CLOB endpoint to confirm auth before the first trade cycle.",
+    "CC-004 (Hedge close is a no-op): The entire hedge strategy — which is the bot's primary risk management mechanism — does nothing in live mode. cancel_order() on a filled FOK order always fails. Replacing it with a sell order (or GTC limit sell) is required before use_hedge=True has any effect in production.",
+    "CC-009 + CC-011 (Daily loss guard disabled in live mode + stale Executor config): The most critical risk control is silently inactive in production, and the hot-reload config never reaches the Executor, meaning user changes to max_daily_loss_pct, dry_run, or bet sizing from the UI have no effect on the live executor. Both must be fixed before the bot is safe to run in live mode with real money."
+  ]
+}

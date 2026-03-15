@@ -1,0 +1,189 @@
+{
+  "audit_type": "CX — Strategy, Product & Experiment Design",
+  "date": "2026-03-15",
+  "auditor": "Claude CX Auditor",
+  "overall_rating": "4/10",
+  "executive_summary": "The Polymarket Hybrid Hedge Bot is a well-engineered piece of software with a clean Streamlit dashboard, sensible code structure, and thoughtful UX details (tooltips, progression previews, auto-refresh fragments). However, the core trading strategy is mathematically broken at the observed market prices, making the entire system unprofitable by construction. The 'hybrid hedge' produces a deeply asymmetric payoff: +$0.02 on a win vs. -$1.79 on a loss — a negative expected value of approximately -$0.885 per cycle assuming 50% win rate. Every other layer (RSI filter, H1 momentum, martingale escalation) is being stacked on top of a fundamentally losing base that no filter or progression system can fix. Furthermore, the backtester uses $0.50 entry price rather than the ~$0.99 observed ask, which means ALL backtest results are optimistic fiction and cannot be used to validate any hypothesis. Until order fills are unblocked (401 error) and real fill prices are confirmed, the system is trading blind.",
+
+  "findings": [
+    {
+      "id": "CX-001",
+      "severity": "critical",
+      "category": "strategy",
+      "title": "Hybrid hedge has negative expected value at $0.99 ask prices — the strategy is a structural loser",
+      "description": "SCENARIOS.md documents the core math honestly: Main leg $1 @ $0.99 ask pays $1.01 if it wins. Hedge leg $1 @ $0.99 sold at $0.20 = -$0.79 loss on the hedge. Net per cycle: WIN = +$0.02, LOSS = -$1.79. At 50% win rate: EV = (0.5 × $0.02) + (0.5 × -$1.79) = -$0.885 per cycle. With 7 assets × 2 directions × 12 cycles/hour = up to 168 cycles/hour, this produces expected losses of roughly $148/hour at $1 base bet. The hedge structure only makes money if the win rate is extremely high (above ~98.9% to break even: solve 0.02w - 1.79(1-w) = 0 → w ≈ 0.989). No RSI or H1 filter can plausibly deliver a 98.9% win rate on 5-minute binary markets. The hedge is not reducing variance — it is converting the strategy from a coin-flip into a nearly certain slow drain.",
+      "recommendation": "Reconsider the hedge mechanics entirely. If ask prices are truly $0.99 on both sides, the market has no liquidity and the spread is the house edge. The only potentially profitable structure would be: (a) trade only the main leg with no hedge, reducing the cost of being wrong, or (b) wait for one side to reprice to a meaningful discount (e.g., $0.55/$0.45 split) before entering the hedge. The hedge as designed is arithmetically guaranteed to lose money unless win rate is near-perfect."
+    },
+    {
+      "id": "CX-002",
+      "severity": "critical",
+      "category": "experiment_design",
+      "title": "Backtester uses $0.50 entry price — all backtest results are invalid relative to live trading",
+      "description": "backtester.py line 125 hardcodes `entry_price = 0.50` as the binary midpoint. In live markets, SCENARIOS.md documents observed ask prices of ~$0.99. This means the backtest models a 100% payout on a win ($1 payout / $0.50 stake = 2x), whereas live trading delivers only ~1.01% payout on a win ($1 payout / $0.99 stake). The backtest PNL calculations are therefore overstated by a factor of approximately 50× on the win side. A backtest showing positive PNL at $0.50 entry tells the user nothing about whether the strategy is viable at $0.99 entry. Worse, the UI presents these results in a polished comparison table with color gradients, which may give false confidence. The backtest also notes that H1 filter is NOT applied (SCENARIOS.md), while it IS enabled in live mode — creating a further simulation/reality gap.",
+      "recommendation": "Add an `entry_price` parameter to the backtester that defaults to the actual observed ask price (configurable in default.yaml). Show a prominent warning in the UI backtest tab that results assume $0.50 entry and may not reflect live fill prices. Better yet, allow the user to set the assumed ask price in the backtest UI and immediately show how the PNL curve changes. Separately, implement the H1 filter in the backtester so the simulated conditions match the live bot configuration."
+    },
+    {
+      "id": "CX-003",
+      "severity": "critical",
+      "category": "risk",
+      "title": "Martingale + hedge + 7 assets + US hours multiplier creates unquantified ruin risk",
+      "description": "The system compounds multiple stake-escalating mechanisms simultaneously. At cap=7, Martingale reaches 2^7 = 128× base bet. The US hours multiplier then doubles that to $256 per direction. With the hedge enabled, a single trade at max Martingale costs $256 (main) + $256 (hedge) = $512 in capital deployed, of which $256 × $0.79 = $202 is immediately at risk from the hedge exit alone. With 7 assets trading in parallel, simultaneous Martingale exhaustion across assets is plausible during any high-volatility trending period. The config also defaults `h1_force_progression: martingale` during H1 bias windows, meaning the system can simultaneously be running Martingale across all 7 assets aligned to the same H1 direction — and all losing together if the move reverses. The `max_daily_loss_pct: 10` stop is defined as a percentage of 'starting balance' but there is no code visible that tracks what that starting balance is or enforces the stop in real-time during a Martingale escalation within a single cycle.",
+      "recommendation": "Define and enforce a hard maximum total capital at risk across all concurrent positions before any cycle begins. Separate the per-asset Martingale cap from the portfolio-level exposure cap. Consider disabling the US hours multiplier when any progressive method is active — doubling an already-escalated Martingale stake is not a higher-conviction signal, it is pure leverage amplification. Add a real-time bankroll tracker so max_daily_loss_pct is enforced in absolute USD terms, not just a config parameter."
+    },
+    {
+      "id": "CX-004",
+      "severity": "high",
+      "category": "strategy",
+      "title": "RSI filter logic is inverted relative to the stated hypothesis",
+      "description": "SCENARIOS.md states: 'Skip UP bet if RSI < 45 (oversold, already pushed down, may snap back).' But if RSI < 45 means the asset is oversold and may snap back UP, then skipping UP bets when RSI < 45 discards exactly the trades most likely to go UP. The code in strategy.py (line 218) implements: `if direction == 'up' and rsi < cfg.rsi_overextended_low: return False`. This skips UP bets when RSI is low (oversold). The comment says 'overextended' but the scenario description says this is when the market 'may snap back' upward — which is the direction you WANT to bet. The filter as implemented appears to fight the mean-reversion hypothesis it claims to embody. The same inversion applies to the DOWN filter. A mean-reversion interpretation of RSI says: bet UP when RSI is low (oversold), bet DOWN when RSI is high (overbought). The current filter does the opposite: it skips UP bets when RSI is low.",
+      "recommendation": "Clarify whether the RSI filter intends to trade momentum (skip counter-trend entries) or mean-reversion (skip exhausted entries). The current code and the current comment are logically inconsistent. Run a paper mode A/B test with the filter inverted to determine which interpretation produces better outcomes empirically before treating either as a real filter."
+    },
+    {
+      "id": "CX-005",
+      "severity": "high",
+      "category": "strategy",
+      "title": "H1 momentum assumption has no theoretical basis for 5-minute binary markets",
+      "description": "The H1 filter assumes that if the current 1-hour candle has a body > 0.3%, momentum will continue at 5-minute resolution for the next 12 windows (~60 minutes). This is a strong assumption with no cited empirical basis. Crypto price movements at 5-minute resolution are largely noise. A 0.3% H1 body can easily be followed by 30 minutes of consolidation or reversal while still ending the hour with a strong candle close. The bias window of 12 trades means the filter commits to a direction for the entire duration of that H1 candle regardless of what the price does next — the filter does not re-evaluate whether the H1 candle is still trending in the bias direction, only whether it starts a NEW bias. Additionally, when H1 bias is active, it forces Martingale progression, which means the bot doubles down on a directional bet that is being held for an arbitrary 60-minute window regardless of mid-window price action.",
+      "recommendation": "At minimum, re-evaluate H1 bias every 5-minute cycle, not just when a new direction appears. Consider reducing the bias window from 12 to 3-4 trades and requiring the H1 candle body to still exceed threshold at each check. Run a controlled experiment: paper trade with H1 filter enabled vs. disabled across 500+ cycles per asset and measure directional accuracy, not just win rate."
+    },
+    {
+      "id": "CX-006",
+      "severity": "high",
+      "category": "strategy",
+      "title": "Progression systems are mathematically inappropriate for this payoff structure",
+      "description": "Martingale and similar negative progression systems are theoretically sound only when: (a) the game is near fair (EV close to 0), (b) the win payout approximately equals the loss, and (c) a win fully recovers prior losses. None of these conditions hold here. With a WIN of +$0.02 and a LOSS of -$1.79, a Martingale win after N losses recovers: $0.02 × 2^N but the accumulated losses are $1.79 × (2^N - 1). After 1 loss followed by a win: recovery = $0.02 × 2 = $0.04; loss accumulated = $1.79. Net after recovery attempt = $0.04 - $1.79 - $1.79 × 2 = deeply negative. The progression systems amplify an already negative EV game — doubling down on a -$0.885 EV bet simply doubles the expected loss. Fibonacci and D'Alembert share the same fundamental problem to lesser degrees.",
+      "recommendation": "Progression systems are a tool for positive or neutral EV games where variance reduction matters. In a negative EV game they accelerate ruin. Do not enable any progressive method until the base single-trade EV is demonstrably positive over at least 200 live paper trades. Use fixed sizing exclusively during the validation phase."
+    },
+    {
+      "id": "CX-007",
+      "severity": "high",
+      "category": "experiment_design",
+      "title": "Order placement is blocked (401 error) but the experiment design treats this as a minor status note",
+      "description": "SCENARIOS.md documents that as of the audit date, ALL live order placement is blocked by a 401 Unauthorized / Invalid API key error. This means zero live data exists. Every 'experiment' listed (RSI value, H1 value, hedge profitability, Martingale vs fixed) cannot be validated because no real trades have ever executed. The paper mode simulates P&L from a $0.50 entry price assumption (same flaw as the backtester). The 401 error is listed as Experiment #1 in the table but is treated as a credential fix rather than a fundamental prerequisite for all other experiments. The system is essentially a hypothesis generator with no validation pathway currently open.",
+      "recommendation": "Treat the 401 auth error as a P0 blocker — nothing else in the experiment plan is meaningful until this is resolved. Once resolved, run at minimum 100 live paper trades with fixed sizing and no filters before enabling any progression or signal filters. Establish a baseline empirical win rate and actual fill price before adding any complexity."
+    },
+    {
+      "id": "CX-008",
+      "severity": "high",
+      "category": "risk",
+      "title": "Kelly sizing uses an assumed 4% edge with no empirical basis — the UI labels this 'realistic'",
+      "description": "default.yaml sets `kelly_estimated_edge: 0.04` (4%) as the default Kelly edge input. The UI tooltip in ui.py (line 281) labels '4% is a reasonable estimate with RSI + H1 filters active.' This is not reasonable — it is a circular assumption. No live trades have executed. No empirical win rate exists. The RSI filter logic appears inverted (CX-004). The H1 filter has no backtested confirmation. Labeling an unvalidated 4% edge as 'reasonable' in UI copy that users will read and internalize is actively misleading. Kelly sizing at an incorrectly estimated edge can be more dangerous than fixed sizing: if the true edge is negative (as the math suggests), Kelly optimal bet size is zero or negative — meaning the 'correct' answer is not to trade at all.",
+      "recommendation": "Change the Kelly edge tooltip to explicitly state: 'WARNING: This is your estimate of your edge. If you have not validated your win rate with real fills, this number is unknown. Using an incorrect edge with Kelly sizing can accelerate ruin faster than fixed sizing.' Default kelly_sizing_enabled to false and add a hard requirement that the user acknowledge they have empirical data before enabling it."
+    },
+    {
+      "id": "CX-009",
+      "severity": "high",
+      "category": "risk",
+      "title": "Simultaneously trading both UP and DOWN on the same asset each cycle effectively places bets on every market",
+      "description": "The generate_signal function is called once per (asset, direction) pair. With 7 assets and 2 directions, the bot places up to 14 directional bets plus 14 hedge bets = 28 orders per 5-minute cycle. When the H1 filter is inactive (no strong H1 candle), both UP and DOWN bets are placed on every asset. This means the bot simultaneously holds a UP main + DOWN hedge AND a DOWN main + UP hedge on the same asset — which is four positions on the same binary market. The two hedge legs (UP hedge + DOWN hedge) cancel each other out but both cost money when sold early. The net effect is paying the spread twice on a single asset with no directional conviction. This is effectively donating money to market makers.",
+      "recommendation": "When both UP and DOWN main bets are placed on the same asset in the same cycle, the hedge legs are redundant and wasteful. Consider restricting trading to one direction per asset per cycle — whichever direction the signal favors — rather than placing symmetrical bets in both directions simultaneously."
+    },
+    {
+      "id": "CX-010",
+      "severity": "medium",
+      "category": "experiment_design",
+      "title": "Backtest direction signal (close > open of the same bar) introduces look-ahead bias",
+      "description": "backtester.py line 95: `direction = 'up' if row['close'] > row['open'] else 'down'`. The direction signal is derived from the same bar that resolves the bet. In live trading, the bot must decide direction BEFORE the 5-minute bar closes. Using the bar's own close/open to both generate the signal and score the outcome means the backtest always predicts the correct direction by construction — the 'signal' is just the outcome label. This produces an artificially inflated win rate in the backtest that has zero predictive validity for live performance. The actual live signal should be based on the PRIOR bar's close/open or a real-time price level at the START of the window.",
+      "recommendation": "Fix the backtest signal to use the prior bar: `direction = 'up' if df.iloc[i-1]['close'] > df.iloc[i-1]['open'] else 'down'`. Then measure whether the prior bar's direction predicts the current bar's direction (serial correlation). This will almost certainly show a win rate near 50%, which is the honest baseline the experiment must start from."
+    },
+    {
+      "id": "CX-011",
+      "severity": "medium",
+      "category": "experiment_design",
+      "title": "Backtester hedge simulation always loses $0.79 regardless of market evolution",
+      "description": "In backtester.py lines 133-135: `hedge_exit_price = cfg.hedge_sell_price_trigger` (0.20). The hedge PNL is always `0.20 × stake - stake = -0.80 × stake`. This assumes the hedge leg always exits at exactly $0.20 with no variation. In reality, the hedge exit price depends on how quickly the market moves. If the main bet direction is confirmed early in the 5-minute window, the hedge leg price drops faster and might be sold at $0.10 or $0.05. If the market remains ambiguous, the hedge leg might be worth $0.40 at the 2.5-minute mark. The fixed $0.20 assumption hides the actual distribution of hedge exit prices, which is the key unknown in the strategy.",
+      "recommendation": "Either model hedge exit price as a function of mid-bar price movement (e.g., if the bar moves 0.5% in the main direction by mid-bar, model hedge exit at $0.10), or at minimum show a sensitivity analysis in the UI: 'What is net PNL if hedge exits at $0.10 / $0.20 / $0.30 / $0.40?' This would immediately show users that the hedge profitability is extremely sensitive to exit price assumptions."
+    },
+    {
+      "id": "CX-012",
+      "severity": "medium",
+      "category": "ux",
+      "title": "Dashboard shows P&L in paper mode without clarifying the $0.50 entry assumption — results are misleading",
+      "description": "The Live Monitor tab shows Total P&L, Win Rate, and a Cumulative P&L chart from paper_trades.csv. If these paper trades use the same $0.50 entry price assumption as the backtester, the displayed P&L does not represent what the user would actually earn in live mode at $0.99 ask prices. A user watching a positive paper P&L trend would be misled into thinking the strategy is profitable when live execution at real prices would produce a very different result. There is no disclaimer on the monitor tab indicating that paper mode P&L is simulated at assumed prices.",
+      "recommendation": "Add a persistent banner on the Live Monitor and Backtest tabs: 'Paper mode P&L is simulated at assumed entry price of $X.XX. Live fill prices may differ significantly. Validate real fill prices before interpreting these results.' Make the assumed entry price configurable and visible in the monitor."
+    },
+    {
+      "id": "CX-013",
+      "severity": "medium",
+      "category": "ux",
+      "title": "No bankroll or session P&L tracker visible in the dashboard — user cannot assess risk in real time",
+      "description": "The Live Monitor tab shows total P&L, win rate, and trade count, but there is no display of: current bankroll, daily starting balance, current daily drawdown percentage, how far from the max_daily_loss_pct stop the bot is, current total capital deployed across all open positions, or Martingale escalation level per asset. A user running Martingale at cap=7 with US hours multiplier could have $512+ deployed on a single asset without any visible warning in the UI.",
+      "recommendation": "Add a 'Risk Panel' to the Live Monitor with: (1) Daily P&L vs. max_daily_loss_pct threshold with a progress bar, (2) Current open exposure per asset and total, (3) Progression level per asset (e.g., 'BTC: Martingale step 4/7'), (4) A red alert banner when any single asset is above step 4/7 on Martingale. These metrics are the difference between informed and blind risk-taking."
+    },
+    {
+      "id": "CX-014",
+      "severity": "medium",
+      "category": "ux",
+      "title": "Progression preview table in sidebar only shows consecutive losses — does not illustrate recovery cost",
+      "description": "The _render_progression_preview function in ui.py (lines 351-362) shows a table of stake sizes at 0, 1, 2, ... N consecutive losses. This is useful for understanding escalation but does not show the critical information: what is the total cumulative capital required to complete one full loss streak + one win recovery? For Martingale at cap=7, the user sees stakes of $1, $2, $4, $8, $16, $32, $64, $128 but does not see that the total capital required to reach step 7 and then win is $255 (losses) + $128 (final bet) = $383, and after the win they recover only $128 × 0.02 = $2.56 in net profit — a 149:1 risk/reward ratio.",
+      "recommendation": "Add a second column to the progression preview: 'Cumulative at risk' and a summary line showing 'Full streak cost: $X, Recovery win net: $Y, Risk/reward: Z:1.' This single table would make the risk of each progression method viscerally clear to any user before they enable it."
+    },
+    {
+      "id": "CX-015",
+      "severity": "medium",
+      "category": "strategy",
+      "title": "US hours multiplier rationale is unvalidated and may amplify losses rather than improve win rate",
+      "description": "The hypothesis states: 'Higher crypto volatility during US hours → more decisive 5m moves → better win rate.' More volatility during US hours does mean larger 5-minute moves, but it does not mean those moves are more predictable. In fact, higher volatility typically increases the noise component of short-term price action. The multiplier of 2× during US hours with no empirical evidence of improved win rate simply doubles the stake — and therefore doubles the expected loss — during a period of higher volatility. With Martingale active during US hours, the combination of 2× multiplier and a running loss streak at cap=7 reaches $256 × 2 = $512 per direction.",
+      "recommendation": "Disable the US hours multiplier entirely until live data shows a statistically significant improvement in win rate during US hours vs. off-hours. The multiplier should only be enabled after at minimum 200 comparable trades in each time window with a measurable win rate difference."
+    },
+    {
+      "id": "CX-016",
+      "severity": "medium",
+      "category": "risk",
+      "title": "max_daily_loss_pct has no enforcement mechanism visible in the codebase",
+      "description": "default.yaml defines `max_daily_loss_pct: 10` and the UI exposes it as a configurable parameter. However, there is no visible enforcement code in strategy.py or backtester.py that checks the running daily P&L against this threshold and halts trading. This is a configuration parameter with no apparent runtime effect, which is worse than not having it — it gives the user a false sense of risk control.",
+      "recommendation": "Audit the bot execution code for max_daily_loss_pct enforcement. If it is not implemented, add a prominent UI warning: 'Note: This parameter is defined but enforcement must be verified in bot.py.' The stop-loss mechanism is only meaningful if it actively prevents order generation when the threshold is breached."
+    },
+    {
+      "id": "CX-017",
+      "severity": "low",
+      "category": "ux",
+      "title": "RSI slider labels are reversed from standard financial convention",
+      "description": "In ui.py (lines 224-233), the RSI sliders are labeled 'Skip UP bets when RSI <' and 'Skip DOWN bets when RSI >'. Standard financial RSI convention labels below 30 as oversold (potential UP signal) and above 70 as overbought (potential DOWN signal). The current labels use 45/55 thresholds, which is in the middle of neutral territory — not overextended at all by standard measures. A user familiar with RSI will find the labels confusing because the conventional meaning of 'RSI < 45' is 'approaching oversold' not 'overextended.'",
+      "recommendation": "Rename the slider labels to 'Skip UP bets when RSI is below (bearish momentum)' and 'Skip DOWN bets when RSI is above (bullish momentum)' to make the momentum-following interpretation explicit. Alternatively, if the intent is mean-reversion, flip the labels and thresholds to match: 'Only take UP bets when RSI < 30 (oversold reversal).' Either way, the current 45/55 band is too close to neutral to provide meaningful signal filtering."
+    },
+    {
+      "id": "CX-018",
+      "severity": "low",
+      "category": "experiment_design",
+      "title": "No A/B test framework or holdout tracking — all experiments run on the same live data stream",
+      "description": "The experiment table in SCENARIOS.md lists 7 separate hypotheses to test (RSI value, H1 value, hedge profitability, Martingale vs fixed, asset selection, etc.), but there is no mechanism to run controlled A/B tests. All filters and settings are applied globally. To test 'RSI filter value,' the user must manually switch the filter on and off across different time periods, which confounds the result with market regime changes. The backtest has the same asset pool, same time period, and same bars for all method comparisons — not separate holdout windows.",
+      "recommendation": "At minimum, add a 'variant' field to each paper trade record so the user can tag periods as 'RSI_on' vs 'RSI_off' and compare win rates for the same assets over similar market conditions. For a more rigorous test, implement odd/even cycle alternation: RSI filter enabled on odd cycles, disabled on even cycles, with results tracked separately."
+    },
+    {
+      "id": "CX-019",
+      "severity": "low",
+      "category": "ux",
+      "title": "Backtest Sharpe ratio is not annualized or meaningfully scaled — the number is uninterpretable",
+      "description": "backtester.py computes Sharpe as `mean(pnl) / stdev(pnl)` across individual trades. This is not an annualized Sharpe ratio. It is an unscaled trade-level coefficient of variation. A Sharpe of 0.05 vs. 0.15 across methods appears meaningful in the comparison table but is not comparable to any standard financial Sharpe benchmark (where >1.0 is generally considered acceptable). A user looking at this column has no frame of reference for what the numbers mean.",
+      "recommendation": "Either label the column 'Trade Consistency (mean/stdev)' to avoid the Sharpe name, or compute a properly scaled Sharpe. For 5-minute trades: annualized Sharpe = (mean_per_trade / stdev_per_trade) × sqrt(252 × 24 × 12) — roughly 2,903 trades per year at 5m interval. Alternatively, remove the Sharpe column from the comparison table and replace with a simpler metric like 'Profit Factor (gross wins / gross losses).'"
+    },
+    {
+      "id": "CX-020",
+      "severity": "low",
+      "category": "ux",
+      "title": "The Controls tab shows raw JSON config but does not highlight which settings are 'live' vs. 'saved'",
+      "description": "tab_controls renders a full st.json of the current config object. When a user changes a sidebar setting but has not yet pressed 'Save Config,' the JSON reflects the in-memory state, not the saved file. This could confuse a user who wants to confirm what the bot is actually running with vs. what they are previewing.",
+      "recommendation": "Add a visual diff or a 'Unsaved changes' badge to the Controls tab when in-memory config differs from the saved config/default.yaml. Alternatively, show two columns: 'Current (unsaved)' and 'Saved (active)' side by side."
+    }
+  ],
+
+  "positive_observations": [
+    "The codebase is clean, well-commented, and modular. strategy.py, backtester.py, and ui.py have clear separation of concerns and are easy to read and reason about.",
+    "The SCENARIOS.md document honestly acknowledges the core open questions including the $0.99 ask price anomaly and the 401 order blocking error — this level of intellectual honesty about unknowns is commendable and should be preserved.",
+    "The progression preview table (_render_progression_preview) is an excellent UX feature that makes abstract progression mechanics concrete and visible before the user commits to a setting.",
+    "The use of Streamlit fragments (st.fragment) for the Live Monitor and Logs tabs is a technically sophisticated choice that avoids unnecessary full-page reloads and provides a better real-time monitoring experience.",
+    "The asset management UI with dynamic add/remove, ticker validation against Binance/Bybit, and session state persistence across reruns is well-designed and user-friendly.",
+    "The Kelly sizing implementation is mathematically correct (half-Kelly with bankroll cap) and the underlying formula in kelly_bet_size() is sound for positive-EV binary markets — it just needs empirical edge validation before use.",
+    "The hedge_sell_trigger_minutes and hedge_sell_price_trigger dual-exit logic (time-based OR price-based exit) is a sensible design pattern that prevents the hedge from expiring into a total loss.",
+    "The sidebar tooltip help text on every control is thorough and educational — users unfamiliar with Martingale or RSI can understand the purpose of each setting without leaving the UI.",
+    "The Telegram alert system with configurable win/loss/drawdown thresholds is a practical operational feature for remote monitoring.",
+    "The weekend_behavior options (skip, momentum_only, off) show thoughtful edge-case handling, and the comment explaining that markets run 24/7 was added after empirical confirmation — good iterative design practice."
+  ],
+
+  "top_3_priorities": [
+    "PRIORITY 1 — Fix the core strategy math before trading any real money. The hybrid hedge at $0.99 ask prices on both sides is a structural loser with EV of approximately -$0.885 per cycle. Either confirm that real fill prices are materially different from $0.99 (which requires unblocking the 401 auth error and observing actual fills), or redesign the hedge to only activate when one side reprices below $0.60. No progression system, filter, or multiplier can overcome a -$0.885 per-trade negative EV.",
+    "PRIORITY 2 — Fix the backtester entry price assumption and the look-ahead bias before using any backtest result for decision-making. The current backtest uses $0.50 entry price (vs. ~$0.99 live) and derives direction signal from the current bar's own close/open (look-ahead). Both errors make backtest results optimistic by construction. Fix entry_price to use the configured ask price, and fix the direction signal to use the prior bar. Run the corrected backtest and confront the honest expected PNL before continuing development.",
+    "PRIORITY 3 — Unblock the 401 auth error and run a minimum 200-trade paper mode baseline with fixed sizing, no hedge, no filters, and no progression before adding any complexity. The entire experiment plan is predicated on observing real fills. Until orders actually execute against the Polymarket CLOB, every number in the system is a model artifact. The baseline experiment must answer three factual questions: (a) What are actual fill prices? (b) What is the empirical win rate with no filters? (c) What is the real hedge exit price distribution? These answers determine whether any further development is justified."
+  ]
+}
