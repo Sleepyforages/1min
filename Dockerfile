@@ -10,8 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps before copying source
+# pysha3 (needed by eip712-structs) requires Python headers; in the official
+# python:slim image they live under /usr/local/include, not /usr/include.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN CFLAGS="-I/usr/local/include/python3.12" pip install --no-cache-dir pysha3 \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY config/ ./config/
