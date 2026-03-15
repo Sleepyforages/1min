@@ -1,50 +1,34 @@
 """
-market_discovery.py — Fetch all active 5-min and 15-min Up/Down markets from
-the Polymarket CLOB API.
+market_discovery.py — Fetch active 5-min and 15-min "Up or Down" markets
+from the Polymarket Gamma API.
 
-Assets are resolved DYNAMICALLY from config — no hardcoded whitelist.
-If a ticker has no Polymarket market, it is skipped with a WARNING log
-(never crashes the bot).
+Market format on Polymarket (2026):
+  "Bitcoin Up or Down - March 16, 10:45AM-10:50AM ET"
+  Outcomes: ["Up", "Down"]  — clobTokenIds[0] = Up token, [1] = Down token
+
+The CLOB API (clob.polymarket.com) only returns legacy 2022-2023 markets.
+The Gamma API (gamma-api.polymarket.com) has current live markets.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-CLOB_BASE = "https://clob.polymarket.com"
+GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-INTERVAL_KEYWORDS = {
-    "5m":  ["5-minute", "5 minute", "5min", "next 5"],
-    "15m": ["15-minute", "15 minute", "15min", "next 15"],
+INTERVAL_MINUTES = {
+    "5m":  5,
+    "15m": 15,
 }
-
-# Direction keywords in market question titles
-_UP_KEYWORDS   = ["up", "higher", "above", "rise", "bull"]
-_DOWN_KEYWORDS = ["down", "lower", "below", "fall", "bear", "drop"]
-
-
-@dataclass
-class PolyMarket:
-    condition_id: str
-    question:     str
-    asset:        str   # as given in config, e.g. "btc", "doge"
-    direction:    str   # "up" | "down"
-    interval:     str   # "5m" | "15m"
-    yes_token_id: str
-    no_token_id:  str
-    end_date_iso: str
-    best_yes_ask: float = 0.0
-    best_no_ask:  float = 0.0
-
-
-# ── Dynamic asset keyword generator ───────────────────────────────────────────
 
 # Well-known aliases kept for accuracy; everything else falls back to the ticker itself
 _ASSET_ALIASES: Dict[str, List[str]] = {
@@ -64,44 +48,77 @@ _ASSET_ALIASES: Dict[str, List[str]] = {
     "atom": ["cosmos", "atom"],
 }
 
+
+@dataclass
+class PolyMarket:
+    condition_id:  str
+    question:      str
+    asset:         str   # as given in config, e.g. "btc", "doge"
+    interval:      str   # "5m" | "15m"
+    up_token_id:   str   # clobTokenIds[0]
+    down_token_id: str   # clobTokenIds[1]
+    end_date_iso:  str
+    best_up_ask:   float = 0.0
+    best_down_ask: float = 0.0
+
+    # Convenience aliases expected by executor/strategy
+    @property
+    def yes_token_id(self) -> str:
+        return self.up_token_id
+
+    @property
+    def no_token_id(self) -> str:
+        return self.down_token_id
+
+
 def _keywords_for(asset: str) -> List[str]:
-    """Return search keywords for an asset ticker."""
     asset = asset.lower()
     return _ASSET_ALIASES.get(asset, [asset])
 
 
 def _match_asset(question: str, assets: List[str]) -> Optional[str]:
-    """Return the matching asset ticker from the configured list, or None."""
     q = question.lower()
     for asset in assets:
         for kw in _keywords_for(asset):
             if kw in q:
-                logger.debug("Market '%s' matched asset '%s' via keyword '%s'", question[:60], asset, kw)
+                logger.debug("Market '%s' matched asset '%s' via keyword '%s'",
+                             question[:60], asset, kw)
                 return asset
     return None
 
 
-def _match_interval(question: str, target: str) -> bool:
-    return any(kw in question.lower() for kw in INTERVAL_KEYWORDS.get(target, []))
+def _match_interval(question: str, slug: str, target: str) -> bool:
+    """Check if a market matches the target interval (5m or 15m)."""
+    minutes = INTERVAL_MINUTES.get(target)
+    if minutes is None:
+        return False
+    slug_lower = slug.lower()
+    q_lower    = question.lower()
+    # Slug check: "btc-updown-5m-..." or "btc-updown-15m-..."
+    if f"-{minutes}m-" in slug_lower or f"updown-{minutes}m" in slug_lower:
+        return True
+    # Question check: "10:45AM-10:50AM" (5-min span) or "10:45AM-11:00AM" (15-min)
+    # Fall back: just check "5m" / "15m" literal in slug
+    if f"{minutes}m" in slug_lower:
+        return True
+    return False
 
 
-def _match_direction(question: str) -> Optional[str]:
-    q = question.lower()
-    if any(kw in q for kw in _UP_KEYWORDS):
-        return "up"
-    if any(kw in q for kw in _DOWN_KEYWORDS):
-        return "down"
-    return None
+# ── Gamma API ──────────────────────────────────────────────────────────────────
 
-
-# ── CLOB pagination ────────────────────────────────────────────────────────────
-
-def _fetch_page(next_cursor: str = "") -> dict:
-    params: dict = {"active": "true", "closed": "false"}
-    if next_cursor:
-        params["next_cursor"] = next_cursor
-    logger.debug("Fetching CLOB markets page cursor='%s'", next_cursor or "start")
-    resp = requests.get(f"{CLOB_BASE}/markets", params=params, timeout=15)
+def _fetch_gamma_page(offset: int = 0, limit: int = 100) -> list:
+    """Fetch one page of active, accepting-orders markets from the Gamma API."""
+    params = {
+        "active":          "true",
+        "closed":          "false",
+        "accepting_orders": "true",
+        "limit":           limit,
+        "offset":          offset,
+        "order":           "endDate",
+        "ascending":       "true",
+    }
+    logger.debug("Fetching Gamma markets offset=%d", offset)
+    resp = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -111,80 +128,108 @@ def _fetch_page(next_cursor: str = "") -> dict:
 def discover_markets(
     interval:  str = "5m",
     assets:    List[str] | None = None,
-    max_pages: int = 20,
+    max_pages: int = 10,
 ) -> List[PolyMarket]:
     """
-    Page through Polymarket CLOB and return matching markets.
-    Assets not found on Polymarket are logged as WARNING — never crash.
+    Fetch active "Up or Down" markets from Polymarket Gamma API.
+    Returns the nearest upcoming window per asset, direction agnostic
+    (each PolyMarket holds both up_token_id and down_token_id).
     """
     if assets is None:
-        from .price_feed import _ASSET_ALIASES
         assets = list(_ASSET_ALIASES.keys())
 
     assets_lower = [a.lower() for a in assets]
     found_assets: set = set()
-    markets: List[PolyMarket] = []
-    cursor = ""
-    pages  = 0
+    # Keep only the soonest market per asset (sorted by endDate ascending)
+    best: Dict[str, PolyMarket] = {}
 
     logger.info("Starting market discovery — interval=%s assets=%s", interval, assets_lower)
 
+    offset = 0
+    limit  = 100
+    pages  = 0
+
     while pages < max_pages:
         try:
-            data = _fetch_page(cursor)
+            page_markets = _fetch_gamma_page(offset=offset, limit=limit)
         except Exception as exc:
-            logger.error("CLOB fetch error on page %d: %s", pages, exc)
+            logger.error("Gamma API fetch error on page %d: %s", pages, exc)
             break
 
-        page_markets = data.get("data", [])
+        if not page_markets:
+            logger.debug("No more markets returned — stopping at page %d", pages)
+            break
+
         logger.debug("Page %d: %d raw markets", pages, len(page_markets))
 
         for m in page_markets:
             question: str = m.get("question", "")
+            slug:     str = m.get("slug", "")
+
+            # Must be an "Up or Down" market
+            if "up or down" not in question.lower():
+                continue
+
+            # Must match the requested interval
+            if not _match_interval(question, slug, interval):
+                logger.debug("Skipping (wrong interval): %s [%s]", question[:80], slug)
+                continue
+
+            # Must match a configured asset
             asset = _match_asset(question, assets_lower)
             if asset is None:
                 continue
-            if not _match_interval(question, interval):
-                continue
-            direction = _match_direction(question)
-            if direction is None:
-                logger.debug("Skipping market (no direction): %s", question[:80])
-                continue
 
-            tokens = m.get("tokens", [])
-            if len(tokens) < 2:
-                logger.debug("Skipping market (missing tokens): %s", question[:80])
+            # Extract token IDs from clobTokenIds (stored as JSON string)
+            raw_tokens = m.get("clobTokenIds", "[]")
+            try:
+                token_ids = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
+            except (json.JSONDecodeError, TypeError):
+                logger.debug("Invalid clobTokenIds for: %s", question[:80])
                 continue
 
-            yes_tok = tokens[0].get("token_id", "")
-            no_tok  = tokens[1].get("token_id", "")
+            if len(token_ids) < 2:
+                logger.debug("Missing token IDs for: %s", question[:80])
+                continue
 
-            markets.append(PolyMarket(
-                condition_id=m.get("condition_id", ""),
+            pm = PolyMarket(
+                condition_id=m.get("conditionId", ""),
                 question=question,
                 asset=asset,
-                direction=direction,
                 interval=interval,
-                yes_token_id=yes_tok,
-                no_token_id=no_tok,
-                end_date_iso=m.get("end_date_iso", ""),
-            ))
-            found_assets.add(asset)
-            logger.debug("Found market: [%s/%s] %s", asset, direction, question[:80])
+                up_token_id=token_ids[0],
+                down_token_id=token_ids[1],
+                end_date_iso=m.get("endDate", ""),
+            )
 
-        cursor = data.get("next_cursor", "")
-        if not cursor or cursor == "LTE=":
-            logger.debug("Market discovery complete after %d pages", pages + 1)
+            # Keep only the soonest window per asset
+            if asset not in best:
+                best[asset] = pm
+                found_assets.add(asset)
+                logger.debug("Found market: [%s] %s (end=%s)", asset, question[:80], pm.end_date_iso)
+            else:
+                logger.debug("Duplicate asset %s — keeping soonest, skipping: %s", asset, question[:60])
+
+        # If we've found all requested assets, stop paging early
+        if found_assets >= set(assets_lower):
+            logger.debug("All requested assets found — stopping early")
             break
-        pages += 1
-        time.sleep(0.25)
 
-    # Warn about assets that had NO Polymarket market at all
+        if len(page_markets) < limit:
+            break  # last page
+
+        offset += limit
+        pages  += 1
+        time.sleep(0.2)
+
+    markets = list(best.values())
+
+    # Warn about assets with no market
     missing = set(assets_lower) - found_assets
     for asset in missing:
         logger.warning(
-            "Asset '%s' is in config but has NO active %s Up/Down market on Polymarket — "
-            "it will be skipped this cycle.", asset, interval
+            "Asset '%s' is in config but has NO active %s Up/Down market on Polymarket "
+            "— it will be skipped this cycle.", asset, interval
         )
 
     logger.info(
@@ -201,16 +246,16 @@ def enrich_with_prices(markets: List[PolyMarket], clob_client=None) -> List[Poly
         return markets
     for m in markets:
         try:
-            ob   = clob_client.get_order_book(m.yes_token_id)
+            ob = clob_client.get_order_book(m.up_token_id)
             asks = ob.get("asks", [])
             if asks:
-                m.best_yes_ask = float(asks[0]["price"])
-            ob2   = clob_client.get_order_book(m.no_token_id)
+                m.best_up_ask = float(asks[0]["price"])
+            ob2 = clob_client.get_order_book(m.down_token_id)
             asks2 = ob2.get("asks", [])
             if asks2:
-                m.best_no_ask = float(asks2[0]["price"])
-            logger.debug("Prices enriched for %s/%s: yes=%.3f no=%.3f",
-                         m.asset, m.direction, m.best_yes_ask, m.best_no_ask)
+                m.best_down_ask = float(asks2[0]["price"])
+            logger.debug("Prices enriched for %s: up=%.3f down=%.3f",
+                         m.asset, m.best_up_ask, m.best_down_ask)
         except Exception as exc:
             logger.warning("Price enrichment failed for %s: %s", m.condition_id, exc)
     return markets

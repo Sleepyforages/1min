@@ -193,23 +193,30 @@ class Executor:
             logger.info("[DRY-RUN] Would trade %s %s $%.2f", signal.asset, signal.direction, signal.stake_usd)
             return None
 
+        # One market holds both Up and Down tokens — pick by signal direction
+        main_token = market.up_token_id   if signal.direction == "up"   else market.down_token_id
+        main_price = market.best_up_ask   if signal.direction == "up"   else market.best_down_ask
+
         main_order = self._place_order(
             asset=signal.asset,
             direction=signal.direction,
-            token_id=market.yes_token_id,
+            token_id=main_token,
             size_usd=signal.stake_usd,
-            price=market.best_yes_ask or 0.5,
+            price=main_price or 0.5,
             is_hedge=False,
         )
 
         hedge_order = None
         if self.cfg.use_hedge and signal.hedge_stake_usd > 0 and hedge_market:
+            hedge_direction = "down" if signal.direction == "up" else "up"
+            hedge_token = hedge_market.down_token_id if signal.direction == "up" else hedge_market.up_token_id
+            hedge_price = hedge_market.best_down_ask if signal.direction == "up" else hedge_market.best_up_ask
             hedge_order = self._place_order(
                 asset=signal.asset,
-                direction="down" if signal.direction == "up" else "up",
-                token_id=hedge_market.yes_token_id,
+                direction=hedge_direction,
+                token_id=hedge_token,
                 size_usd=signal.hedge_stake_usd,
-                price=hedge_market.best_yes_ask or 0.5,
+                price=hedge_price or 0.5,
                 is_hedge=True,
             )
             # Schedule hedge close after trigger time

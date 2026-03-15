@@ -93,12 +93,12 @@ class Bot:
             return
 
         market_index: Dict[str, PolyMarket] = {
-            f"{m.asset}_{m.direction}": m for m in markets
+            m.asset: m for m in markets
         }
         logger.info("Active markets: %d", len(markets))
         for m in markets:
-            logger.debug("  Market: [%s/%s] end=%s yes_ask=%.3f",
-                         m.asset, m.direction, m.end_date_iso, m.best_yes_ask)
+            logger.debug("  Market: [%s] end=%s up_ask=%.3f down_ask=%.3f",
+                         m.asset, m.end_date_iso, m.best_up_ask, m.best_down_ask)
 
         if cfg.mode == "live":
             logger.debug("Enriching market prices from CLOB …")
@@ -137,13 +137,13 @@ class Bot:
 
     def _process_asset(self, cfg: Config, asset: str, market_index: Dict[str, PolyMarket]):
         logger.debug("Processing asset: %s", asset)
-        for direction in ["up", "down"]:
-            key    = f"{asset}_{direction}"
-            market = market_index.get(key)
-            if not market:
-                logger.debug("  No active Polymarket for %s/%s — skipping", asset, direction)
-                continue
+        # One market per asset now covers both Up and Down tokens
+        market = market_index.get(asset)
+        if not market:
+            logger.debug("  No active Polymarket for %s — skipping", asset)
+            return
 
+        for direction in ["up", "down"]:
             logger.debug("  Generating signal for %s/%s …", asset, direction)
             momentum_signal = direction
 
@@ -171,14 +171,9 @@ class Bot:
                         asset, direction, sig.stake_usd, sig.hedge_stake_usd,
                         sig.progression_used, sig.rsi_value or 0, sig.h1_bias or "none")
 
-            hedge_key    = f"{asset}_{'down' if direction == 'up' else 'up'}"
-            hedge_market = market_index.get(hedge_key)
-            if cfg.use_hedge and not hedge_market:
-                logger.warning("  Hedge market not found for %s/%s — placing main leg only",
-                               asset, direction)
-
             try:
-                pos = self.executor.execute_signal(sig, market, hedge_market)
+                # market has both up/down tokens; executor picks the right one by direction
+                pos = self.executor.execute_signal(sig, market, market)
             except Exception as exc:
                 logger.error("  Order execution error for %s/%s: %s", asset, direction, exc)
                 continue
