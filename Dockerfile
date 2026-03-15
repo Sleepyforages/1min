@@ -24,6 +24,7 @@ print('eip712_structs shim created at', shim)"
 # Copy project files
 COPY config/ ./config/
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 
 # Create runtime directories
 RUN mkdir -p data logs
