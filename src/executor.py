@@ -132,16 +132,34 @@ class LiveExecutor:
             api_passphrase=cfg.api_passphrase,
         )
         funder = cfg.funder_address or None
+        # signature_type=1 = POLY_PROXY: required for Polymarket proxy/email wallets.
+        # The funder address is the proxy contract that holds USDC; the signer key
+        # signs on its behalf.  EOA wallets (signature_type=0) require manual
+        # on-chain ERC-20 approvals; proxy wallets have them pre-set by Polymarket.
+        sig_type = 1 if funder else 0
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,  # Polygon mainnet
             key=cfg.private_key,
             creds=creds,
             funder=funder,
+            signature_type=sig_type,
         )
-        logger.info("LiveExecutor initialised  signer=%s  funder=%s",
+        # Force the CLOB server to re-read on-chain balances (clears stale cache)
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            self.client.update_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            bal = self.client.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            logger.info("CLOB balance after sync: %s", bal)
+        except Exception as exc:
+            logger.warning("Balance sync failed (non-fatal): %s", exc)
+        logger.info("LiveExecutor initialised  signer=%s  funder=%s  sig_type=%s",
                     self.client.signer.address() if self.client.signer else "none",
-                    funder or "(same as signer)")
+                    funder or "(same as signer)", sig_type)
 
     def place_market_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
         """
