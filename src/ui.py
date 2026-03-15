@@ -41,6 +41,8 @@ for key, default in [
     ("backtest_trades",  None),
     ("backtest_summary", None),
     ("asset_error",      ""),
+    ("last_validated_ticker", ""),
+    ("working_assets",   None),   # persists asset list across reruns
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -70,8 +72,19 @@ def render_sidebar() -> Config:
         )
 
         # ── Dynamic asset management ───────────────────────────────────────────
+        # working_assets lives in session_state so it survives reruns between
+        # "Add ticker" and "Save Config" button clicks.
+        if st.session_state.working_assets is None:
+            st.session_state.working_assets = list(cfg.assets)
+
+        # If config file was changed externally, sync session state
+        if set(st.session_state.working_assets) != set(cfg.assets) and \
+                st.session_state.get("last_saved_assets") == st.session_state.working_assets:
+            st.session_state.working_assets = list(cfg.assets)
+
+        current_assets = st.session_state.working_assets
+
         st.caption("**Assets** — type any ticker (BTC, DOGE, HYPE…) and press Enter to add")
-        current_assets = list(cfg.assets)
 
         new_ticker = st.text_input(
             "Add ticker",
@@ -81,8 +94,8 @@ def render_sidebar() -> Config:
             help="Any crypto ticker. The bot will warn in logs if it has no Polymarket market or price feed.",
         ).strip().lower()
 
-        # Clear sticky error as soon as user starts typing a new ticker
-        if new_ticker != st.session_state.get("last_validated_ticker", ""):
+        # Clear sticky error as soon as user types a different ticker
+        if new_ticker != st.session_state.last_validated_ticker:
             st.session_state.asset_error = ""
 
         if new_ticker and new_ticker not in current_assets:
@@ -93,18 +106,17 @@ def render_sidebar() -> Config:
                     ok, reason = validate_asset(new_ticker)
                 st.session_state.last_validated_ticker = new_ticker
                 if ok:
-                    current_assets.append(new_ticker)
-                    cfg.assets = current_assets
+                    st.session_state.working_assets = current_assets + [new_ticker]
                     st.success(f"{new_ticker.upper()} added ✅")
                 else:
                     st.session_state.asset_error = (
                         f"⚠️ **{new_ticker.upper()}** not found on Binance or Bybit.\n\n"
                         f"{reason}\n\n"
-                        f"It will still be added — the bot will log a warning and skip price-feed-dependent "
-                        f"filters (RSI, H1) for this asset, but will still look for its Polymarket markets."
+                        f"Added anyway — bot will skip price-feed filters for this asset "
+                        f"but will still search for its Polymarket markets."
                     )
-                    current_assets.append(new_ticker)
-                    cfg.assets = current_assets
+                    st.session_state.working_assets = current_assets + [new_ticker]
+                st.rerun()
         elif new_ticker and new_ticker in current_assets:
             st.caption(f"{new_ticker.upper()} is already in the list.")
 
@@ -120,9 +132,11 @@ def render_sidebar() -> Config:
             if col_b.button("✕", key=f"rm_{a}"):
                 remove = a
         if remove:
-            current_assets.remove(remove)
-            cfg.assets = current_assets
+            st.session_state.working_assets = [a for a in current_assets if a != remove]
             st.rerun()
+
+        # Always keep cfg.assets in sync with session state
+        cfg.assets = list(st.session_state.working_assets)
 
         cfg.base_bet_usd = st.number_input(
             "Base Bet (USD)", min_value=0.10, max_value=1000.0,
@@ -328,7 +342,8 @@ def render_sidebar() -> Config:
     if st.sidebar.button("💾 Save Config", type="primary",
                          help="Write all settings to config/default.yaml. Bot hot-reloads on next cycle."):
         save_config(cfg)
-        st.sidebar.success("Config saved!")
+        st.session_state.last_saved_assets = list(cfg.assets)
+        st.sidebar.success(f"Config saved! Assets: {[a.upper() for a in cfg.assets]}")
 
     return cfg
 
