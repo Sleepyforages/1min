@@ -2,9 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system deps
+# Install system deps (build-essential + python3-dev needed for pysha3/eip712-structs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps before copying source
