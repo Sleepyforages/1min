@@ -58,46 +58,53 @@ def main():
         funder=funder or None,
     )
 
-    # ── Step 1: test L1 auth ────────────────────────────────────────────────
+    # ── Step 1: test L1 auth by attempting to create an API key ───────────────
     logger.info("")
-    logger.info("Step 1 — Testing L1 auth ...")
+    logger.info("Step 1 — Testing L1 auth (attempting create_api_key) ...")
+    creds = None
     try:
-        existing_keys = client.get_api_keys()
-        logger.info("L1 auth OK. Existing CLOB API keys: %s", existing_keys)
+        creds = client.create_api_key()
+        logger.info("L1 auth OK — new CLOB API key created.")
         l1_ok = True
     except Exception as exc:
-        logger.error("L1 auth FAILED: %s", exc)
-        logger.error("")
-        logger.error("Possible causes:")
-        logger.error("  1. Private key is for a proxy wallet — set POLYMARKET_FUNDER_ADDRESS")
-        logger.error("     to your main MetaMask wallet address (0xcef717...)")
-        logger.error("  2. Wallet has not interacted with Polymarket CLOB contracts")
-        logger.error("  3. Wrong private key")
-        l1_ok = False
+        err_str = str(exc)
+        logger.warning("create_api_key result: %s", err_str)
+        # If key already exists we may get a conflict — try derive instead
+        if "exist" in err_str.lower() or "conflict" in err_str.lower() or "400" in err_str:
+            logger.info("Key may already exist, trying derive_api_key ...")
+            try:
+                creds = client.derive_api_key()
+                logger.info("L1 auth OK — existing CLOB API key derived.")
+                l1_ok = True
+            except Exception as exc2:
+                logger.error("derive_api_key also failed: %s", exc2)
+                l1_ok = False
+        else:
+            logger.error("L1 auth FAILED: %s", exc)
+            logger.error("")
+            logger.error("Possible causes:")
+            logger.error("  1. Private key is for a proxy wallet — set POLYMARKET_FUNDER_ADDRESS")
+            logger.error("     to your main MetaMask wallet address (0xcef717...)")
+            logger.error("  2. Wallet has not interacted with Polymarket CLOB contracts")
+            logger.error("  3. Wrong private key")
+            l1_ok = False
 
     if not l1_ok:
         logger.info("")
-        logger.info("Trying with funder heuristic ...")
-        # Check if funder address is already set but wrong, or missing
         if not funder:
-            logger.info("  → Add POLYMARKET_FUNDER_ADDRESS=<your-main-wallet> to .env and retry")
+            logger.info("→ Add POLYMARKET_FUNDER_ADDRESS=<your-main-wallet> to .env and retry")
         sys.exit(1)
 
-    # ── Step 2: create or derive CLOB API key ──────────────────────────────
+    # ── Step 2: print credentials ──────────────────────────────────────────
     logger.info("")
-    logger.info("Step 2 — Creating/deriving CLOB API credentials ...")
-    try:
-        creds = client.create_or_derive_api_creds()
-        logger.info("SUCCESS! Add these to your .env file:")
-        logger.info("")
-        logger.info("  POLYMARKET_API_KEY=%s", creds.api_key)
-        logger.info("  POLYMARKET_API_SECRET=%s", creds.api_secret)
-        logger.info("  POLYMARKET_API_PASSPHRASE=%s", creds.api_passphrase)
-        logger.info("")
-        logger.info("These replace the Builder API key in .env.")
-    except Exception as exc:
-        logger.error("Credential creation failed: %s", exc)
-        sys.exit(1)
+    logger.info("Step 2 — CLOB credentials:")
+    logger.info("")
+    logger.info("  Add these to your .env file (replace the Builder API key):")
+    logger.info("")
+    logger.info("  POLYMARKET_API_KEY=%s", creds.api_key)
+    logger.info("  POLYMARKET_API_SECRET=%s", creds.api_secret)
+    logger.info("  POLYMARKET_API_PASSPHRASE=%s", creds.api_passphrase)
+    logger.info("")
 
     # ── Step 3: verify L2 auth with new creds ─────────────────────────────
     logger.info("Step 3 — Verifying L2 auth with new credentials ...")
