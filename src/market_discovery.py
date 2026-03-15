@@ -123,12 +123,12 @@ def _fetch_event_by_slug(slug: str) -> Optional[dict]:
 def _is_clob_live(token_id: str) -> bool:
     """Return True if the CLOB order book for this token is accessible (HTTP 200).
 
-    CLOB only activates a market when the trading window actually opens.
-    Pre-created or weekend markets return 404 even when Gamma shows them as active.
+    Uses the /book endpoint (not /order-book which is legacy/unused).
+    Returns False only for genuinely missing markets, not for empty books.
     """
     try:
         resp = requests.get(
-            f"{CLOB_BASE}/order-book",
+            f"{CLOB_BASE}/book",
             params={"token_id": token_id},
             timeout=5,
         )
@@ -216,11 +216,10 @@ def discover_markets(
             continue
 
         # CLOB liveness check — confirms the market is live and accepting orders.
-        # Skipped when weekend_behavior="off" so the bot can attempt trades any time.
+        # Skipped when weekend_behavior="off".
         if not skip_clob_check and not _is_clob_live(token_ids[0]):
             logger.warning(
-                "Asset '%s': CLOB not live for window %s–%s UTC "
-                "(weekend or market not yet activated). Skipping.",
+                "Asset '%s': CLOB not live for window %s–%s UTC. Skipping.",
                 asset,
                 window_start_dt.strftime("%H:%M"),
                 window_end_dt.strftime("%H:%M"),
@@ -252,22 +251,26 @@ def discover_markets(
     return markets
 
 
+def _get_best_ask(token_id: str) -> float:
+    """Fetch best ask price from CLOB /book endpoint. Returns 0.0 on failure."""
+    try:
+        resp = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=5)
+        if resp.status_code == 200:
+            asks = resp.json().get("asks", [])
+            if asks:
+                return float(asks[0]["price"])
+    except Exception as exc:
+        logger.debug("Best ask fetch failed for %s…: %s", token_id[:20], exc)
+    return 0.0
+
+
 def enrich_with_prices(markets: List[PolyMarket], clob_client=None) -> List[PolyMarket]:
-    """Enrich markets with live ask prices from the CLOB order book."""
-    if clob_client is None:
-        logger.debug("enrich_with_prices: no clob_client, skipping")
-        return markets
+    """Enrich markets with live ask prices from the CLOB /book endpoint."""
     for m in markets:
         try:
-            ob = clob_client.get_order_book(m.up_token_id)
-            asks = ob.get("asks", [])
-            if asks:
-                m.best_up_ask = float(asks[0]["price"])
-            ob2 = clob_client.get_order_book(m.down_token_id)
-            asks2 = ob2.get("asks", [])
-            if asks2:
-                m.best_down_ask = float(asks2[0]["price"])
-            logger.debug("Prices enriched for %s: up=%.3f down=%.3f",
+            m.best_up_ask   = _get_best_ask(m.up_token_id)
+            m.best_down_ask = _get_best_ask(m.down_token_id)
+            logger.debug("Prices for %s: up_ask=%.3f down_ask=%.3f",
                          m.asset, m.best_up_ask, m.best_down_ask)
         except Exception as exc:
             logger.warning("Price enrichment failed for %s: %s", m.condition_id, exc)
