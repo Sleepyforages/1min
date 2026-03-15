@@ -92,7 +92,11 @@ def _fetch_polygon(asset: str, interval: str, limit: int) -> pd.DataFrame:
     # 404 / empty = asset not on Polygon
     if resp.status_code == 404:
         raise UnsupportedAssetError(f"Polygon: ticker {ticker} not found (404)")
-    resp.raise_for_status()
+    # Catch HTTPError and re-raise without the URL (which contains the API key)
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        raise PriceFeedError(f"Polygon HTTP {resp.status_code} for {ticker}") from None
 
     results = resp.json().get("results", [])
     if not results:

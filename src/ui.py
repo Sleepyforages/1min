@@ -376,11 +376,13 @@ def tab_controls(cfg: Config):
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("▶ Start Bot", disabled=running, type="primary"):
+            # Use DEVNULL — the bot's FileHandler writes to logs/bot.log already.
+            # A PIPE with no reader eventually stalls the worker process.
             proc = subprocess.Popen(
                 [sys.executable, "-m", "src.bot"],
                 cwd=str(ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             st.session_state.bot_process = proc
             st.success("Bot started!")
@@ -613,6 +615,25 @@ def tab_logs():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    import os
+    dash_pwd = os.environ.get("DASHBOARD_PASSWORD", "")
+    if dash_pwd:
+        if not st.session_state.get("authenticated"):
+            st.title("🔐 Dashboard Login")
+            pwd = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if pwd == dash_pwd:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Wrong password")
+            st.stop()
+    else:
+        st.warning(
+            "⚠️ Dashboard is publicly accessible. Set `DASHBOARD_PASSWORD` in `.env` to enable login protection.",
+            icon="⚠️",
+        )
+
     cfg = render_sidebar()
 
     tab1, tab2, tab3, tab4 = st.tabs([

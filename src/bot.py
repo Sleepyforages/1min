@@ -61,6 +61,9 @@ class Bot:
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
 
+        if self.cfg.mode == "live" and not self.cfg.dry_run:
+            self._live_preflight()
+
         while self._running:
             try:
                 logger.debug("Hot-reloading config …")
@@ -86,6 +89,9 @@ class Bot:
 
     def _run_cycle(self):
         cfg = self.cfg
+        # Sync executor with freshly hot-reloaded config so dry_run, use_hedge,
+        # max_daily_loss_pct, etc. are never stale inside the executor
+        self.executor.cfg = cfg
         now = datetime.now(timezone.utc).isoformat()
         logger.info("━" * 60)
         logger.info("CYCLE START  %s", now)
@@ -144,54 +150,75 @@ class Bot:
         for t in threads:
             t.join(timeout=60)
 
+    def _get_signal_direction(self, asset: str, cfg: Config) -> Optional[str]:
+        """
+        Determine ONE direction for this asset this cycle from the last closed price bar.
+        Returns "up" if close > open, "down" otherwise, or None if data unavailable.
+        """
+        try:
+            from .price_feed import fetch_ohlcv
+            df = fetch_ohlcv(asset, interval=cfg.interval, limit=3)
+            if len(df) < 2:
+                return None
+            last = df.iloc[-2]  # last CLOSED bar (not the still-open current one)
+            direction = "up" if last["close"] > last["open"] else "down"
+            logger.debug("  Direction signal %s: %s (close=%.4f open=%.4f)",
+                         asset, direction, last["close"], last["open"])
+            return direction
+        except Exception as exc:
+            logger.warning("  Direction fetch failed for %s: %s — skipping", asset, exc)
+            return None
+
     def _process_asset(self, cfg: Config, asset: str, market_index: Dict[str, PolyMarket]):
         logger.debug("Processing asset: %s", asset)
-        # One market per asset now covers both Up and Down tokens
         market = market_index.get(asset)
         if not market:
             logger.debug("  No active Polymarket for %s — skipping", asset)
             return
 
-        for direction in ["up", "down"]:
-            logger.debug("  Generating signal for %s/%s …", asset, direction)
-            momentum_signal = direction
+        # Select ONE direction per asset per cycle — never trade both sides simultaneously
+        direction = self._get_signal_direction(asset, cfg)
+        if direction is None:
+            logger.info("  %s — no direction signal available, skipping", asset)
+            return
 
-            with self._lock:
-                try:
-                    sig: TradeSignal = generate_signal(
-                        asset=asset,
-                        direction=direction,
-                        momentum_signal=momentum_signal,
-                        cfg=cfg,
-                        states=self.states,
-                        last_results=self.last_results,
-                    )
-                except Exception as exc:
-                    logger.error("Signal generation error for %s/%s: %s", asset, direction, exc)
-                    continue
-
-            if sig.skipped:
-                logger.info("  SKIP %s/%s — reason: %s  rsi=%.1f  h1_bias=%s",
-                            asset, direction, sig.skip_reason,
-                            sig.rsi_value or 0, sig.h1_bias or "none")
-                continue
-
-            logger.info("  SIGNAL %s/%s  stake=$%.2f  hedge=$%.2f  prog=%s  rsi=%.1f  h1=%s",
-                        asset, direction, sig.stake_usd, sig.hedge_stake_usd,
-                        sig.progression_used, sig.rsi_value or 0, sig.h1_bias or "none")
-
+        logger.debug("  Generating signal for %s/%s …", asset, direction)
+        with self._lock:
             try:
-                # market has both up/down tokens; executor picks the right one by direction
-                pos = self.executor.execute_signal(sig, market, market)
+                sig: TradeSignal = generate_signal(
+                    asset=asset,
+                    direction=direction,
+                    momentum_signal=direction,
+                    cfg=cfg,
+                    states=self.states,
+                    last_results=self.last_results,
+                )
             except Exception as exc:
-                logger.error("  Order execution error for %s/%s: %s", asset, direction, exc)
-                continue
+                logger.error("Signal generation error for %s/%s: %s", asset, direction, exc)
+                return
 
-            if pos:
-                logger.info("  OPENED position id=%s %s/%s $%.2f",
-                            pos.main_order.order_id, asset, direction, sig.stake_usd)
-                if cfg.mode == "paper":
-                    self._paper_settle(pos, cfg)
+        if sig.skipped:
+            logger.info("  SKIP %s/%s — reason: %s  rsi=%.1f  h1_bias=%s",
+                        asset, direction, sig.skip_reason,
+                        sig.rsi_value or 0, sig.h1_bias or "none")
+            return
+
+        logger.info("  SIGNAL %s/%s  stake=$%.2f  hedge=$%.2f  prog=%s  rsi=%.1f  h1=%s",
+                    asset, direction, sig.stake_usd, sig.hedge_stake_usd,
+                    sig.progression_used, sig.rsi_value or 0, sig.h1_bias or "none")
+
+        try:
+            # market has both up/down tokens; executor picks the right one by direction
+            pos = self.executor.execute_signal(sig, market, market)
+        except Exception as exc:
+            logger.error("  Order execution error for %s/%s: %s", asset, direction, exc)
+            return
+
+        if pos:
+            logger.info("  OPENED position id=%s %s/%s $%.2f",
+                        pos.main_order.order_id, asset, direction, sig.stake_usd)
+            if cfg.mode == "paper":
+                self._paper_settle(pos, cfg)
 
     def _paper_settle(self, pos, cfg: Config):
         """Simulate outcome for paper mode and fire alerts."""
@@ -205,11 +232,35 @@ class Bot:
             result = "win" if pnl > 0 else "loss"
             key = f"{pos.asset}_{pos.main_order.direction}"
             self.last_results[key] = result
+            self._append_paper_trade(pos, outcome, pnl)
 
         if pnl > 0:
             alert_trade_win(pos.asset, pos.main_order.direction, pnl, cfg)
         else:
             alert_trade_loss(pos.asset, pos.main_order.direction, pnl, cfg)
+
+    def _append_paper_trade(self, pos, outcome: str, pnl: float):
+        """Persist paper trade to data/paper_trades.csv for the Live Monitor."""
+        import csv
+        from pathlib import Path
+        path = Path("data/paper_trades.csv")
+        path.parent.mkdir(exist_ok=True)
+        write_header = not path.exists() or path.stat().st_size == 0
+        balance = self.executor.paper.balance if self.executor.paper else 0.0
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["timestamp", "asset", "direction", "stake_usd",
+                             "outcome", "pnl_usd", "balance"])
+            w.writerow([
+                pos.main_order.timestamp.isoformat(),
+                pos.asset,
+                pos.main_order.direction,
+                round(pos.main_order.size_usd, 4),
+                outcome,
+                round(pnl, 4),
+                round(balance, 4),
+            ])
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -231,6 +282,58 @@ class Bot:
                 return 0.0
             return abs(min(pnl, 0)) / bankroll * 100
         return 0.0
+
+    def _live_preflight(self):
+        """
+        Validate live trading readiness before entering the cycle loop.
+        Checks CLOB auth, USDC.e balance, and exchange allowances.
+        Logs warnings rather than hard-failing so the operator can react via the UI.
+        """
+        import requests as _req
+        logger.info("Running live preflight checks…")
+        live = self.executor.live
+        if live is None:
+            logger.error("Preflight: executor has no live client — cannot validate")
+            return
+
+        # 1. CLOB auth
+        try:
+            orders = live.client.get_orders()
+            logger.info("Preflight OK: CLOB auth  open_orders=%d", len(orders) if orders else 0)
+        except Exception as exc:
+            logger.error("Preflight FAIL: CLOB auth error — %s", exc)
+            logger.error("Bot will continue but live orders will fail until auth is fixed")
+            return
+
+        # 2. CLOB balance and allowances
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, RequestArgs
+            from py_clob_client.endpoints import GET_BALANCE_ALLOWANCE
+            from py_clob_client.headers.headers import create_level_2_headers
+            from py_clob_client.http_helpers.helpers import add_balance_allowance_params_to_url
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0)
+            req = RequestArgs(method="GET", request_path=GET_BALANCE_ALLOWANCE)
+            hdrs = create_level_2_headers(live.client.signer, live.client.creds, req)
+            url = add_balance_allowance_params_to_url(
+                "https://clob.polymarket.com" + GET_BALANCE_ALLOWANCE, params)
+            r = _req.get(url, headers=hdrs, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                balance = int(data.get("balance", 0)) / 1e6
+                allowances = data.get("allowances", {})
+                any_allowance = any(int(v) > 0 for v in allowances.values())
+                logger.info("Preflight OK: CLOB balance=$%.4f  allowances_set=%s",
+                            balance, any_allowance)
+                if balance < 1.0:
+                    logger.warning("Preflight WARNING: CLOB balance $%.4f < $1 — "
+                                   "trades will likely fail. Add USDC.e to wallet.", balance)
+                if not any_allowance:
+                    logger.error("Preflight FAIL: no USDC.e allowances set — "
+                                 "run the approval script before starting live trading")
+        except Exception as exc:
+            logger.warning("Preflight: balance check error (non-fatal): %s", exc)
+
+        logger.info("Preflight complete — entering cycle loop")
 
     def _shutdown(self, signum, frame):
         logger.info("Shutdown signal — stopping cleanly")
