@@ -590,12 +590,19 @@ def tab_logs():
     """Auto-refreshes every 10s — no button needed."""
     st.header("📋 Logs")
     log_path = ROOT / "logs" / "bot.log"
-    if log_path.exists():
+
+    col_title, col_btn = st.columns([6, 1])
+    with col_btn:
+        if st.button("🗑 Clear", help="Truncate the log file and start fresh"):
+            log_path.write_text("")
+            st.rerun(scope="fragment")
+
+    if log_path.exists() and log_path.stat().st_size > 0:
         with open(log_path) as f:
             lines = f.readlines()
         tail = "".join(lines[-300:])
         now  = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        st.caption(f"_Auto-refreshes every 10s — last: {now} UTC — {len(lines)} total lines_")
+        col_title.caption(f"_Auto-refreshes every 10s — last: {now} UTC — {len(lines)} total lines_")
         st.code(tail, language="text")
     else:
         st.info("No log file yet — start the bot to generate logs.")
