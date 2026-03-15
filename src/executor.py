@@ -167,26 +167,36 @@ class LiveExecutor:
                     self.client.signer.address() if self.client.signer else "none",
                     funder or "(same as signer)")
 
-    def place_market_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
+    def place_limit_buy(self, token_id: str, size_usd: float, price: float) -> tuple[str, float]:
         """
-        Place a market buy order.
-        Returns (order_id, entry_price).
-        price=0 lets the CLOB calculate the best available price.
-        """
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        Place a GTC resting limit buy order.
+        Returns (order_id, price).
 
-        order_args = MarketOrderArgs(
+        Polymarket minimum constraints enforced here:
+          - size >= 5 shares
+          - price * size >= 1.00 USD notional
+        size_usd is converted to shares at the given price.
+        """
+        import math
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        # Convert USD → shares, then enforce minimums
+        raw_shares = size_usd / price if price > 0 else 5.0
+        size = max(5.0, math.ceil(raw_shares * 1e6) / 1e6)
+        if price * size < 1.0:
+            size = math.ceil((1.0 / price) * 1e6) / 1e6
+
+        order_args = OrderArgs(
             token_id=token_id,
-            amount=size_usd,
-            side=BUY,
-            price=price,        # 0 = auto-calculate from order book
-            fee_rate_bps=1000,  # required by Polymarket: 10% taker fee
+            price=price,
+            size=size,
+            side="BUY",         # plain string — no import needed
         )
-        signed_order = self.client.create_market_order(order_args)
-        resp = self.client.post_order(signed_order, OrderType.FOK)
+        signed_order = self.client.create_order(order_args)
+        resp = self.client.post_order(signed_order, OrderType.GTC)
         order_id = resp.get("orderID", "unknown")
-        logger.info("Live order placed: %s  response=%s", order_id, resp)
+        logger.info("Limit buy placed: %s  size=%.4f shares  price=%.3f  response=%s",
+                    order_id, size, price, resp)
         return order_id, price
 
     def place_limit_sell(self, token_id: str, token_size: float, price: float) -> str:
@@ -194,14 +204,12 @@ class LiveExecutor:
         Sell `token_size` tokens at `price` (GTC limit sell — used to close hedge).
         """
         from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY, SELL
 
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=token_size,
-            side=SELL,
-            fee_rate_bps=1000,
+            side="SELL",        # plain string — no import needed
         )
         signed_order = self.client.create_order(order_args)
         resp = self.client.post_order(signed_order, OrderType.GTC)
@@ -339,7 +347,7 @@ class Executor:
         if self.cfg.mode == "paper":
             self.paper.place_order(order)
         else:
-            order.order_id, actual_price = self.live.place_market_buy(token_id, size_usd, price)
+            order.order_id, actual_price = self.live.place_limit_buy(token_id, size_usd, price)
             order.fill_price = actual_price if actual_price > 0 else (price if price > 0 else 0.5)
             order.token_size = size_usd / order.fill_price if order.fill_price > 0 else 0.0
             order.filled = True

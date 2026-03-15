@@ -351,16 +351,8 @@ def main():
         ],
     )
 
-    if cfg.mode == "backtest":
-        from .backtester import export_trades_csv, run_backtest
-        logger.info("Running backtest …")
-        trades_df, summary_df = run_backtest(cfg)
-        print("\n=== BACKTEST SUMMARY ===")
-        print(summary_df.to_string(index=False))
-        export_trades_csv(trades_df)
-    else:
-        bot = Bot(cfg)
-        bot.run()
+    bot = Bot(cfg)
+    bot.run()
 
 
 if __name__ == "__main__":

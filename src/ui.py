@@ -38,8 +38,6 @@ st.set_page_config(
 # ── Session state ──────────────────────────────────────────────────────────────
 for key, default in [
     ("bot_process",      None),
-    ("backtest_trades",  None),
-    ("backtest_summary", None),
     ("asset_error",      ""),
     ("last_validated_ticker", ""),
     ("working_assets",   None),   # persists asset list across reruns
@@ -58,11 +56,12 @@ def render_sidebar() -> Config:
 
     # ── Mode & Market ──────────────────────────────────────────────────────────
     with st.sidebar.expander("Mode & Market", expanded=True):
+        mode_options = ["paper", "live"]
         cfg.mode = st.selectbox(
             "Operating Mode",
-            ["paper", "live", "backtest"],
-            index=["paper", "live", "backtest"].index(cfg.mode),
-            help="paper = simulate trades locally | live = real orders on Polymarket | backtest = historical simulation",
+            mode_options,
+            index=mode_options.index(cfg.mode) if cfg.mode in mode_options else 0,
+            help="paper = simulate trades locally | live = real orders on Polymarket",
         )
         cfg.interval = st.selectbox(
             "Candle Interval",
@@ -516,75 +515,7 @@ def tab_monitor(cfg: Config):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Backtest
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tab_backtest(cfg: Config):
-    st.header("🔬 Backtest")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        _bt_options = sorted(set(cfg.assets) | {"btc", "eth", "sol", "xrp"})
-        bt_assets = st.multiselect(
-            "Assets to test", _bt_options, default=cfg.assets,
-            help="Only assets with a price feed can be backtested.",
-        )
-    with col2:
-        bt_bars = st.slider("Historical bars", 100, 2000, 500, 100,
-                            help="Number of OHLCV candles to simulate. More bars = slower but more reliable.")
-    with col3:
-        bt_methods = st.multiselect(
-            "Progression methods",
-            ["fixed", "martingale", "fibonacci", "dalembert"],
-            default=["fixed", "martingale", "fibonacci", "dalembert"],
-            help="Run any combination of methods in parallel and compare results.",
-        )
-
-    col_a, col_b = st.columns(2)
-    run_single = col_a.button("▶ Run Selected Methods")
-    run_all    = col_b.button("▶ Run All Methods (comparison)", type="primary")
-
-    if run_single or run_all:
-        methods = bt_methods if run_single else ["fixed", "martingale", "fibonacci", "dalembert"]
-        with st.spinner("Running backtest …"):
-            from src.backtester import export_trades_csv, run_backtest
-            bt_cfg = Config(**{k: getattr(cfg, k) for k in cfg.__dataclass_fields__})
-            trades_df, summary_df = run_backtest(bt_cfg, assets=bt_assets,
-                                                  progression_types=methods, bars=bt_bars)
-            st.session_state.backtest_trades  = trades_df
-            st.session_state.backtest_summary = summary_df
-
-    summary_df = st.session_state.backtest_summary
-    trades_df  = st.session_state.backtest_trades
-
-    if summary_df is not None and not summary_df.empty:
-        st.subheader("📊 Comparison Table")
-        styled = summary_df.style.background_gradient(subset=["net_pnl"], cmap="RdYlGn")
-        st.dataframe(styled, use_container_width=True)
-
-        fig = px.bar(summary_df, x="progression_type", y="net_pnl", color="use_hedge",
-                     barmode="group", title="Net PNL by Method × Hedge",
-                     labels={"net_pnl": "Net P&L (USD)", "progression_type": "Method"})
-        st.plotly_chart(fig, use_container_width=True)
-
-        fig2 = px.scatter(summary_df, x="win_rate", y="max_drawdown",
-                          color="progression_type", symbol="use_hedge", size="total_trades",
-                          hover_data=["net_pnl", "sharpe"],
-                          title="Drawdown vs Win Rate (bubble = # trades)")
-        st.plotly_chart(fig2, use_container_width=True)
-
-        if st.button("📥 Export Trades CSV"):
-            from src.backtester import export_trades_csv
-            export_trades_csv(trades_df, str(ROOT / "data" / "backtest_trades.csv"))
-            st.success("Exported to data/backtest_trades.csv")
-
-    if trades_df is not None and not trades_df.empty:
-        with st.expander("Raw trade records"):
-            st.dataframe(trades_df, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Logs
+# TAB 3 — Logs
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.fragment(run_every=10)
@@ -636,10 +567,9 @@ def main():
 
     cfg = render_sidebar()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
         "🤖 Controls",
         "📡 Live Monitor",
-        "🔬 Backtest",
         "📋 Logs",
     ])
     with tab1:
@@ -647,8 +577,6 @@ def main():
     with tab2:
         tab_monitor(cfg)
     with tab3:
-        tab_backtest(cfg)
-    with tab4:
         tab_logs()
 
 
