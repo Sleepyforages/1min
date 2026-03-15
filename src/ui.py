@@ -77,28 +77,36 @@ def render_sidebar() -> Config:
             "Add ticker",
             value="",
             placeholder="e.g. DOGE",
+            key="new_ticker_input",
             help="Any crypto ticker. The bot will warn in logs if it has no Polymarket market or price feed.",
         ).strip().lower()
 
+        # Clear sticky error as soon as user starts typing a new ticker
+        if new_ticker != st.session_state.get("last_validated_ticker", ""):
+            st.session_state.asset_error = ""
+
         if new_ticker and new_ticker not in current_assets:
             if st.button(f"+ Add {new_ticker.upper()}"):
-                # Live validation
-                with st.spinner(f"Checking {new_ticker.upper()} on Binance…"):
+                st.session_state.asset_error = ""
+                with st.spinner(f"Checking {new_ticker.upper()} on Binance / Bybit…"):
                     from src.price_feed import validate_asset
                     ok, reason = validate_asset(new_ticker)
+                st.session_state.last_validated_ticker = new_ticker
                 if ok:
                     current_assets.append(new_ticker)
                     cfg.assets = current_assets
-                    st.session_state.asset_error = ""
                     st.success(f"{new_ticker.upper()} added ✅")
                 else:
                     st.session_state.asset_error = (
-                        f"⚠️ **{new_ticker.upper()}** has no price feed: {reason}\n\n"
-                        f"It will be added but may produce warnings in logs."
+                        f"⚠️ **{new_ticker.upper()}** not found on Binance or Bybit.\n\n"
+                        f"{reason}\n\n"
+                        f"It will still be added — the bot will log a warning and skip price-feed-dependent "
+                        f"filters (RSI, H1) for this asset, but will still look for its Polymarket markets."
                     )
-                    # Add anyway — user's choice; bot will log exceptions
                     current_assets.append(new_ticker)
                     cfg.assets = current_assets
+        elif new_ticker and new_ticker in current_assets:
+            st.caption(f"{new_ticker.upper()} is already in the list.")
 
         if st.session_state.asset_error:
             st.warning(st.session_state.asset_error)

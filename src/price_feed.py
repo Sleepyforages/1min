@@ -24,8 +24,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-POLYGON_BASE = "https://api.polygon.io/v2"
-_CCXT_EXCHANGE = None  # lazy singleton
+POLYGON_BASE    = "https://api.polygon.io/v2"
+_CCXT_EXCHANGE  = None   # Binance — lazy singleton
+_CCXT_BYBIT     = None   # Bybit fallback — lazy singleton
 
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
@@ -57,6 +58,12 @@ def _get_ccxt_exchange() -> ccxt.Exchange:
     if _CCXT_EXCHANGE is None:
         _CCXT_EXCHANGE = ccxt.binance({"enableRateLimit": True})
     return _CCXT_EXCHANGE
+
+def _get_bybit() -> ccxt.Exchange:
+    global _CCXT_BYBIT
+    if _CCXT_BYBIT is None:
+        _CCXT_BYBIT = ccxt.bybit({"enableRateLimit": True})
+    return _CCXT_BYBIT
 
 
 # ── Polygon.io ─────────────────────────────────────────────────────────────────
@@ -100,39 +107,58 @@ def _fetch_polygon(asset: str, interval: str, limit: int) -> pd.DataFrame:
 
 # ── CCXT / Binance ─────────────────────────────────────────────────────────────
 
-def _fetch_ccxt(asset: str, interval: str, limit: int) -> pd.DataFrame:
-    exchange = _get_ccxt_exchange()
-    symbol   = _ccxt_symbol(asset)
-    tf       = INTERVAL_TO_CCXT[interval]
+def _fetch_from_exchange(exchange: ccxt.Exchange, asset: str, interval: str, limit: int) -> pd.DataFrame:
+    """Try to fetch OHLCV from a given CCXT exchange. Raises UnsupportedAssetError if not listed."""
+    name   = exchange.id
+    symbol = _ccxt_symbol(asset)
+    tf     = INTERVAL_TO_CCXT[interval]
 
-    logger.debug("CCXT request: %s %s limit=%d", symbol, tf, limit)
-
-    # Validate symbol exists on Binance before fetching
+    logger.debug("%s request: %s %s limit=%d", name, symbol, tf, limit)
     try:
         markets = exchange.load_markets()
     except Exception as exc:
-        raise PriceFeedError(f"CCXT: failed to load markets — {exc}") from exc
+        raise PriceFeedError(f"{name}: failed to load markets — {exc}") from exc
 
-    if symbol not in markets:
-        # Try USDC pair as fallback (e.g. some assets only have /USDC on Binance)
-        usdc_symbol = f"{asset.upper()}/USDC"
-        if usdc_symbol in markets:
-            symbol = usdc_symbol
-            logger.debug("CCXT: using fallback symbol %s", symbol)
-        else:
-            raise UnsupportedAssetError(
-                f"CCXT: symbol {_ccxt_symbol(asset)} (and /USDC) not found on Binance — "
-                f"asset '{asset}' may not be supported"
-            )
+    # Try USDT, then USDC
+    resolved = None
+    for candidate in [symbol, f"{asset.upper()}/USDC"]:
+        if candidate in markets:
+            resolved = candidate
+            break
 
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    if resolved is None:
+        raise UnsupportedAssetError(
+            f"{name}: {symbol} (and /USDC) not listed — asset '{asset}' unavailable on {name}"
+        )
+
+    if resolved != symbol:
+        logger.debug("%s: using fallback symbol %s", name, resolved)
+
+    ohlcv = exchange.fetch_ohlcv(resolved, timeframe=tf, limit=limit)
     if not ohlcv:
-        raise UnsupportedAssetError(f"CCXT: empty OHLCV response for {symbol}")
+        raise UnsupportedAssetError(f"{name}: empty OHLCV for {resolved}")
 
     df = pd.DataFrame(ohlcv, columns=["timestamp_ms", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
-    logger.debug("CCXT: %d bars for %s", len(df), symbol)
+    logger.debug("%s: %d bars for %s", name, len(df), resolved)
     return df[["timestamp", "open", "high", "low", "close", "volume"]].set_index("timestamp")
+
+
+def _fetch_ccxt(asset: str, interval: str, limit: int) -> pd.DataFrame:
+    """Try Binance first, then Bybit for assets not listed on Binance (e.g. HYPE)."""
+    last_exc: Exception = UnsupportedAssetError("no exchange tried")
+    for exchange in [_get_ccxt_exchange(), _get_bybit()]:
+        try:
+            return _fetch_from_exchange(exchange, asset, interval, limit)
+        except UnsupportedAssetError as exc:
+            logger.debug("Not on %s: %s", exchange.id, exc)
+            last_exc = exc
+        except Exception as exc:
+            logger.warning("%s error for %s: %s", exchange.id, asset, exc)
+            last_exc = exc
+    raise UnsupportedAssetError(
+        f"Asset '{asset}' not found on Binance or Bybit: {last_exc}"
+    )
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -215,17 +241,25 @@ def get_h1_data(asset: str) -> Optional[Dict[str, float]]:
     Returns None and logs a warning for unsupported assets.
     """
     try:
-        exchange = _get_ccxt_exchange()
+        # Try Binance, then Bybit
         symbol   = _ccxt_symbol(asset)
+        exchange = None
+        for ex in [_get_ccxt_exchange(), _get_bybit()]:
+            try:
+                mkts = ex.load_markets()
+                for candidate in [symbol, f"{asset.upper()}/USDC"]:
+                    if candidate in mkts:
+                        symbol   = candidate
+                        exchange = ex
+                        break
+                if exchange:
+                    break
+            except Exception:
+                continue
 
-        markets = exchange.load_markets()
-        if symbol not in markets:
-            usdc = f"{asset.upper()}/USDC"
-            if usdc in markets:
-                symbol = usdc
-            else:
-                logger.warning("H1 data: asset '%s' not on Binance — skipping H1 filter", asset)
-                return None
+        if exchange is None:
+            logger.warning("H1 data: '%s' not found on Binance or Bybit — skipping H1 filter", asset)
+            return None
 
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=2)
         if not ohlcv:

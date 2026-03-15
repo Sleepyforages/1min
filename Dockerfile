@@ -1,11 +1,8 @@
 FROM python:3.12-slim
 
-# Security: run as non-root
-RUN groupadd -r botuser && useradd -r -g botuser botuser
-
 WORKDIR /app
 
-# Install system deps first (layer-cache friendly)
+# Install system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -18,10 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY config/ ./config/
 COPY src/ ./src/
 
-# Create runtime directories and fix ownership
-RUN mkdir -p data logs && chown -R botuser:botuser /app
-
-USER botuser
+# Create runtime directories
+RUN mkdir -p data logs
 
 # Expose Streamlit port
 EXPOSE 8501
