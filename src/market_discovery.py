@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -174,6 +174,23 @@ def discover_markets(
             if not _match_interval(question, slug, interval):
                 logger.debug("Skipping (wrong interval): %s [%s]", question[:80], slug)
                 continue
+
+            # Only trade windows that start within the next 15 minutes or have already started.
+            # This prevents the bot from grabbing tomorrow's pre-created markets which the
+            # CLOB rejects as "market not found" because they aren't funded/ready yet.
+            start_str = m.get("eventStartTime") or m.get("startDate", "")
+            end_str   = m.get("endDate", "")
+            now       = datetime.now(timezone.utc)
+            try:
+                start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                end_dt   = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                window_open   = start_dt <= now + timedelta(minutes=15)
+                window_active = start_dt <= now <= end_dt
+                if not (window_open or window_active):
+                    logger.debug("Skipping future market (starts in >15min): %s", question[:80])
+                    continue
+            except (ValueError, AttributeError):
+                pass  # if dates can't be parsed, don't filter
 
             # Must match a configured asset
             asset = _match_asset(question, assets_lower)
