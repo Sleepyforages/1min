@@ -154,7 +154,8 @@ class LiveExecutor:
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=size_usd,
-            price=price,   # 0 = auto-calculate from order book
+            price=price,        # 0 = auto-calculate from order book
+            fee_rate_bps=1000,  # required by Polymarket: 10% taker fee
         )
         signed_order = self.client.create_market_order(order_args)
         resp = self.client.post_order(signed_order, OrderType.FOK)
@@ -173,6 +174,7 @@ class LiveExecutor:
             price=price,
             size=token_size,
             side=SELL,
+            fee_rate_bps=1000,
         )
         signed_order = self.client.create_order(order_args)
         resp = self.client.post_order(signed_order, OrderType.GTC)
