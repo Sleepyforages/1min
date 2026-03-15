@@ -1,0 +1,46 @@
+# Polymarket Hybrid Hedge Bot — Default Configuration
+# All values can be overridden via the Streamlit UI sidebar.
+
+# ── Operating Mode ─────────────────────────────────────────────────────────────
+mode: paper                  # live | paper | backtest
+
+# ── Market Settings ────────────────────────────────────────────────────────────
+interval: 5m                 # 5m | 15m
+assets:
+  - btc
+  - eth
+  - sol
+  - xrp
+
+# ── Bet Sizing ─────────────────────────────────────────────────────────────────
+base_bet_usd: 1.0            # Base stake per trade in USD
+
+# ── Progression ────────────────────────────────────────────────────────────────
+progression_type: fixed      # fixed | martingale | fibonacci | dalembert
+progression_cap: 7           # Max steps for progressive methods (3–7 recommended)
+
+# ── Hedge Settings ─────────────────────────────────────────────────────────────
+use_hedge: true
+hedge_sell_trigger_minutes: 2.5   # Sell hedge leg after N minutes
+hedge_sell_price_trigger: 0.20    # Also sell if price drops to this (e.g. 0.20 = 20¢)
+
+# ── US-Hours Multiplier ────────────────────────────────────────────────────────
+us_hours_multiplier: 2.0
+us_hours_start_utc: 14       # 14:00 UTC = 10 AM EST
+us_hours_end_utc: 20         # 20:00 UTC =  4 PM EST
+
+# ── RSI Filter ─────────────────────────────────────────────────────────────────
+rsi_filter_enabled: true
+rsi_period: 14
+rsi_overextended_low: 45     # Skip UP bets when RSI < this
+rsi_overextended_high: 55    # Skip DOWN bets when RSI > this
+
+# ── Weekend Behaviour ──────────────────────────────────────────────────────────
+weekend_behavior: momentum_only   # skip | momentum_only
+
+# ── Risk Management ────────────────────────────────────────────────────────────
+dry_run: false
+max_daily_loss_pct: 10       # Stop trading if daily P&L < -X%
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_level: INFO
