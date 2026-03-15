@@ -146,9 +146,10 @@ class LiveExecutor:
             amount=size_usd,
             price=price,
         )
-        resp = self.client.create_market_order(order_args)
+        signed_order = self.client.create_market_order(order_args)
+        resp = self.client.post_order(signed_order, OrderType.FOK)
         order_id = resp.get("orderID", "unknown")
-        logger.info("Live order placed: %s", order_id)
+        logger.info("Live order placed: %s  response=%s", order_id, resp)
         return order_id
 
     def cancel_order(self, order_id: str) -> bool:
