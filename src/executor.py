@@ -275,14 +275,16 @@ class Executor:
 
         # One market holds both Up and Down tokens — pick by signal direction
         main_token = market.up_token_id   if signal.direction == "up"   else market.down_token_id
-        main_price = market.best_up_ask   if signal.direction == "up"   else market.best_down_ask
+        market_price = market.best_up_ask if signal.direction == "up"   else market.best_down_ask
+        # Use fixed entry_price if configured (e.g. 0.51), else live market price
+        main_price = self.cfg.entry_price if self.cfg.entry_price > 0 else (market_price or 0.5)
 
         main_order = self._place_order(
             asset=signal.asset,
             direction=signal.direction,
             token_id=main_token,
             size_usd=signal.stake_usd,
-            price=main_price or 0.5,
+            price=main_price,
             is_hedge=False,
         )
 
@@ -290,7 +292,9 @@ class Executor:
         if self.cfg.use_hedge and signal.hedge_stake_usd > 0 and hedge_market:
             hedge_direction = "down" if signal.direction == "up" else "up"
             hedge_token = hedge_market.down_token_id if signal.direction == "up" else hedge_market.up_token_id
-            hedge_price = hedge_market.best_down_ask if signal.direction == "up" else hedge_market.best_up_ask
+            hedge_price = self.cfg.entry_price if self.cfg.entry_price > 0 else (
+                hedge_market.best_down_ask if signal.direction == "up" else hedge_market.best_up_ask
+            )
             hedge_order = self._place_order(
                 asset=signal.asset,
                 direction=hedge_direction,

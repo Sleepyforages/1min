@@ -86,16 +86,16 @@ class PolyMarket:
 
 # ── Window timestamp helpers ────────────────────────────────────────────────────
 
-def _current_window_end_ts(interval_mins: int) -> int:
-    """Return the Unix timestamp of the END of the currently active window.
+def _current_window_end_ts(interval_mins: int, offset: int = 0) -> int:
+    """Return the Unix timestamp of the END of the window at +offset windows from now.
 
-    5-minute windows end at :00, :05, :10, ..., :55 past each hour.
-    15-minute windows end at :00, :15, :30, :45.
+    offset=0 → current window end
+    offset=1 → next window end (used for pre-market order placement)
     """
     now_ts = int(time.time())
     interval_secs = interval_mins * 60
-    # Ceiling division: smallest multiple of interval_secs that is > now_ts
-    return ((now_ts + interval_secs) // interval_secs) * interval_secs
+    current_end = ((now_ts + interval_secs) // interval_secs) * interval_secs
+    return current_end + offset * interval_secs
 
 
 # ── Gamma event lookup by slug ─────────────────────────────────────────────────
@@ -145,6 +145,7 @@ def discover_markets(
     assets:    List[str] | None = None,
     max_pages: int = 5,   # kept for API compat, not used in slug approach
     skip_clob_check: bool = False,
+    window_offset: int = 0,
 ) -> List[PolyMarket]:
     """
     Discover active "Up or Down" markets for the CURRENT trading window.
@@ -168,8 +169,8 @@ def discover_markets(
         logger.error("Unknown interval '%s'", interval)
         return []
 
-    # Compute current window
-    window_end_ts    = _current_window_end_ts(interval_mins)
+    # Compute target window (offset=0 → current, offset=1 → next)
+    window_end_ts    = _current_window_end_ts(interval_mins, offset=window_offset)
     window_start_ts  = window_end_ts - interval_mins * 60
     window_end_dt    = datetime.fromtimestamp(window_end_ts,   tz=timezone.utc)
     window_start_dt  = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)

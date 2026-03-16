@@ -2,18 +2,17 @@
 # All values can be overridden via the Streamlit UI sidebar.
 
 # ── Operating Mode ─────────────────────────────────────────────────────────────
-mode: paper                  # live | paper | backtest
+mode: live                   # live | paper | backtest
 
 # ── Market Settings ────────────────────────────────────────────────────────────
 interval: 5m                 # 5m | 15m
 assets:
-  - btc
-  - eth
   - sol
-  - xrp
+  - doge
 
 # ── Bet Sizing ─────────────────────────────────────────────────────────────────
 base_bet_usd: 1.0            # Base stake per trade in USD
+entry_price: 0.51            # Fixed entry price for all orders (0 = use live market price)
 
 # ── Progression ────────────────────────────────────────────────────────────────
 progression_type: fixed      # fixed | martingale | fibonacci | dalembert

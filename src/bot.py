@@ -72,19 +72,24 @@ class Bot:
                 self._maybe_reset_daily_pnl()
                 self._run_cycle()
                 self._cycle_count += 1
-                # Auto-redeem every 3 cycles (~15 min at 5m interval)
-                if self.cfg.mode == "live" and self._cycle_count % 3 == 0:
+                # Auto-redeem every 2 cycles (~10 min at 5m interval)
+                if self.cfg.mode == "live" and self._cycle_count % 2 == 0:
                     self._auto_redeem()
             except Exception as exc:
                 logger.exception("Unhandled cycle error: %s", exc)
 
-            # Sleep until 2 seconds AFTER the next window boundary so we always
-            # enter at the very start of a fresh window (not mid-window).
+            # Sleep until 30s BEFORE the next window boundary.
+            # At that point the current bar has 30 seconds left — enough to read
+            # its live direction and place a pre-market order on the next window.
             interval_secs = INTERVAL_SECONDS.get(self.cfg.interval, 300)
             now_ts = int(time.time())
             next_boundary = ((now_ts + interval_secs) // interval_secs) * interval_secs
-            sleep_secs = max(1, next_boundary - now_ts + 2)
-            logger.info("Cycle complete — sleeping %ds until next window boundary", sleep_secs)
+            trigger_ts = next_boundary - 30
+            # If we're already inside the last 30s of the current window, skip to the next one
+            if trigger_ts <= now_ts:
+                trigger_ts += interval_secs
+            sleep_secs = max(1, trigger_ts - now_ts)
+            logger.info("Cycle complete — sleeping %ds (trigger at 30s before next boundary)", sleep_secs)
             for _ in range(sleep_secs):
                 if not self._running:
                     break
@@ -102,11 +107,13 @@ class Bot:
         logger.info("CYCLE START  %s", now)
         logger.info("━" * 60)
 
-        logger.debug("Discovering %s markets for assets: %s", cfg.interval, cfg.assets)
+        # Discover the NEXT window's markets — orders placed pre-market
+        logger.debug("Discovering NEXT %s markets for assets: %s", cfg.interval, cfg.assets)
         markets = discover_markets(
             interval=cfg.interval,
             assets=cfg.assets,
             skip_clob_check=(cfg.weekend_behavior == "off"),
+            window_offset=1,
         )
         if not markets:
             logger.warning("No Polymarket markets found this cycle — nothing to trade")
@@ -157,18 +164,19 @@ class Bot:
 
     def _get_signal_direction(self, asset: str, cfg: Config) -> Optional[str]:
         """
-        Determine ONE direction for this asset this cycle from the last closed price bar.
-        Returns "up" if close > open, "down" otherwise, or None if data unavailable.
+        Read the CURRENT (still-open) bar direction at ~30s before window close.
+        At 4:30 into the 5-min bar the direction is stable enough to signal on.
+        Returns "up" if current bar close > open, "down" otherwise.
         """
         try:
             from .price_feed import fetch_ohlcv
             df = fetch_ohlcv(asset, interval=cfg.interval, limit=3)
-            if len(df) < 2:
+            if len(df) < 1:
                 return None
-            last = df.iloc[-2]  # last CLOSED bar (not the still-open current one)
-            direction = "up" if last["close"] > last["open"] else "down"
-            logger.debug("  Direction signal %s: %s (close=%.4f open=%.4f)",
-                         asset, direction, last["close"], last["open"])
+            current = df.iloc[-1]  # current open bar (read at ~4:30 into window)
+            direction = "up" if current["close"] > current["open"] else "down"
+            logger.debug("  Direction signal %s: %s (close=%.4f open=%.4f) [current bar]",
+                         asset, direction, current["close"], current["open"])
             return direction
         except Exception as exc:
             logger.warning("  Direction fetch failed for %s: %s — skipping", asset, exc)
