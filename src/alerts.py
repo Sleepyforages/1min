@@ -85,6 +85,17 @@ def alert_daily_limit(daily_loss_pct: float, cfg) -> None:
     )
 
 
+def alert_redemption(redeemed: int, amount_usd: float, wallet_balance: float, cfg) -> None:
+    if not cfg.telegram_alerts_enabled:
+        return
+    send_async(
+        f"💰 *REDEEMED* {redeemed} winning position{'s' if redeemed != 1 else ''}\n"
+        f"Amount: `+${amount_usd:.2f}` USDC.e\n"
+        f"Wallet: `${wallet_balance:.2f}` USDC.e\n"
+        f"Address: `0x347C80CE3a2786AE2e7f2BcE57f64aD032904A63`"
+    )
+
+
 def alert_bot_started(cfg) -> None:
     if not cfg.telegram_alerts_enabled:
         return

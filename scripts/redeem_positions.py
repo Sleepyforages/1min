@@ -109,8 +109,10 @@ def redeem_all(private_key: str, dry_run: bool = False) -> None:
             continue
 
         try:
-            nonce = w3.eth.get_transaction_count(signer, "pending")
-            gas_price = w3.eth.gas_price
+            # Use latest confirmed nonce (not pending) to avoid nonce collisions
+            nonce = w3.eth.get_transaction_count(signer, "latest")
+            # 2× gas price to ensure fast inclusion on Polygon
+            gas_price = int(w3.eth.gas_price * 2)
 
             tx = ctf.functions.redeemPositions(
                 Web3.to_checksum_address(USDC_E),
@@ -128,7 +130,7 @@ def redeem_all(private_key: str, dry_run: bool = False) -> None:
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             print(f"  TX sent: 0x{tx_hash.hex()}")
 
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             if receipt["status"] == 1:
                 gas_used = receipt["gasUsed"]
                 total_gas_spent += gas_used
@@ -138,8 +140,8 @@ def redeem_all(private_key: str, dry_run: bool = False) -> None:
                 print(f"  REVERTED  receipt={receipt}")
                 failed += 1
 
-            # Brief pause to avoid nonce issues
-            time.sleep(1.5)
+            # Wait for confirmation to propagate before next tx
+            time.sleep(3)
 
         except Exception as exc:
             print(f"  ERROR: {exc}")

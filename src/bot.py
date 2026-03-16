@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from .alerts import alert_bot_started, alert_daily_limit, alert_drawdown, alert_trade_loss, alert_trade_win
+from .alerts import alert_bot_started, alert_daily_limit, alert_drawdown, alert_redemption, alert_trade_loss, alert_trade_win
 from .config import Config, load_config
 from .executor import Executor
 from .market_discovery import PolyMarket, discover_markets, enrich_with_prices
@@ -40,6 +40,7 @@ class Bot:
         self._running = False
         self._last_reset_day: Optional[int] = None
         self._lock = threading.Lock()
+        self._cycle_count: int = 0
 
     def run(self):
         self._running = True
@@ -70,6 +71,10 @@ class Bot:
                 self.cfg = load_config()
                 self._maybe_reset_daily_pnl()
                 self._run_cycle()
+                self._cycle_count += 1
+                # Auto-redeem every 3 cycles (~15 min at 5m interval)
+                if self.cfg.mode == "live" and self._cycle_count % 3 == 0:
+                    self._auto_redeem()
             except Exception as exc:
                 logger.exception("Unhandled cycle error: %s", exc)
 
@@ -334,6 +339,113 @@ class Bot:
             logger.warning("Preflight: balance check error (non-fatal): %s", exc)
 
         logger.info("Preflight complete — entering cycle loop")
+
+    def _auto_redeem(self):
+        """
+        Redeem all redeemable winning positions on-chain.
+        Called every 3 cycles (~15 min). Fires a Telegram alert with the amount.
+        """
+        import os
+        from web3 import Web3
+        from web3.middleware import ExtraDataToPOAMiddleware
+
+        WALLET         = "0x347C80CE3a2786AE2e7f2BcE57f64aD032904A63"
+        CTF_CONTRACT   = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        USDC_E         = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        PARENT_COLL_ID = b"\x00" * 32
+        RPC_URL        = "https://polygon-bor-rpc.publicnode.com"
+        CTF_ABI        = [{
+            "name": "redeemPositions", "type": "function",
+            "inputs": [
+                {"name": "collateralToken",    "type": "address"},
+                {"name": "parentCollectionId", "type": "bytes32"},
+                {"name": "conditionId",        "type": "bytes32"},
+                {"name": "indexSets",          "type": "uint256[]"},
+            ],
+            "outputs": [], "stateMutability": "nonpayable",
+        }]
+
+        try:
+            import requests as _req
+            r = _req.get("https://data-api.polymarket.com/positions",
+                         params={"user": WALLET, "sizeThreshold": "0.01"}, timeout=15)
+            r.raise_for_status()
+            positions = r.json()
+        except Exception as exc:
+            logger.warning("Auto-redeem: positions fetch failed — %s", exc)
+            return
+
+        from collections import defaultdict
+        by_cond: dict = defaultdict(list)
+        total_redeemable_usd = 0.0
+        for p in positions:
+            if p.get("redeemable") and p.get("curPrice", 0) == 1.0:
+                cid = p["conditionId"]
+                idx = 2 ** p["outcomeIndex"]
+                if idx not in by_cond[cid]:
+                    by_cond[cid].append(idx)
+                total_redeemable_usd += p.get("currentValue", 0)
+
+        if not by_cond:
+            logger.debug("Auto-redeem: nothing to redeem this cycle")
+            return
+
+        logger.info("Auto-redeem: %d conditions, est. $%.2f", len(by_cond), total_redeemable_usd)
+
+        private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+        if not private_key:
+            logger.error("Auto-redeem: POLYMARKET_PRIVATE_KEY not set")
+            return
+
+        try:
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            account = w3.eth.account.from_key(private_key)
+            ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_CONTRACT), abi=CTF_ABI)
+
+            success = 0
+            for cid, index_sets in by_cond.items():
+                try:
+                    nonce     = w3.eth.get_transaction_count(account.address, "latest")
+                    gas_price = int(w3.eth.gas_price * 2)
+                    tx = ctf.functions.redeemPositions(
+                        Web3.to_checksum_address(USDC_E),
+                        PARENT_COLL_ID,
+                        bytes.fromhex(cid.removeprefix("0x")),
+                        index_sets,
+                    ).build_transaction({"from": account.address, "nonce": nonce,
+                                         "gasPrice": gas_price, "gas": 120_000})
+                    signed = account.sign_transaction(tx)
+                    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                    if receipt["status"] == 1:
+                        success += 1
+                        logger.info("Auto-redeem OK: %s  block=%d", cid[:20], receipt["blockNumber"])
+                    else:
+                        logger.warning("Auto-redeem reverted: %s", cid[:20])
+                    import time as _time; _time.sleep(3)
+                except Exception as exc:
+                    logger.warning("Auto-redeem tx error for %s: %s", cid[:20], exc)
+
+            if success > 0:
+                # Fetch new wallet balance
+                try:
+                    bal_r = _req.post(RPC_URL, json={
+                        "jsonrpc": "2.0", "method": "eth_call",
+                        "params": [{"to": USDC_E,
+                                    "data": "0x70a08231" + WALLET[2:].zfill(64)}, "latest"],
+                        "id": 1,
+                    }, timeout=8)
+                    wallet_bal = int(bal_r.json().get("result", "0x0"), 16) / 1e6
+                except Exception:
+                    wallet_bal = 0.0
+
+                logger.info("Auto-redeem complete: %d/%d redeemed  $%.2f  wallet=$%.2f",
+                            success, len(by_cond), total_redeemable_usd, wallet_bal)
+                alert_redemption(success, total_redeemable_usd, wallet_bal, self.cfg)
+
+        except Exception as exc:
+            logger.error("Auto-redeem failed: %s", exc)
 
     def _shutdown(self, signum, frame):
         logger.info("Shutdown signal — stopping cleanly")
