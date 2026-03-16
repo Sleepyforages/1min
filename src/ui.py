@@ -375,13 +375,16 @@ def tab_controls(cfg: Config):
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("▶ Start Bot", disabled=running, type="primary"):
-            # Use DEVNULL — the bot's FileHandler writes to logs/bot.log already.
-            # A PIPE with no reader eventually stalls the worker process.
+            # stdout goes to DEVNULL (bot uses FileHandler → logs/bot.log).
+            # stderr redirected to logs/bot_err.log to capture crashes.
+            import pathlib
+            pathlib.Path(str(ROOT) + "/logs").mkdir(exist_ok=True)
+            err_log = open(str(ROOT) + "/logs/bot_err.log", "a")
             proc = subprocess.Popen(
                 [sys.executable, "-m", "src.bot"],
                 cwd=str(ROOT),
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=err_log,
             )
             st.session_state.bot_process = proc
             st.success("Bot started!")
