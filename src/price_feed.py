@@ -18,6 +18,8 @@ import os
 import time
 from typing import Dict, List, Optional
 
+import threading
+
 import ccxt
 import pandas as pd
 import requests
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 POLYGON_BASE    = "https://api.massive.com/v2"   # formerly api.polygon.io — same endpoint paths
 _CCXT_EXCHANGE  = None   # Binance — lazy singleton
 _CCXT_BYBIT     = None   # Bybit fallback — lazy singleton
+_CCXT_LOCK      = threading.Lock()   # serialises load_markets() — not thread-safe in CCXT
 
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
@@ -119,7 +122,8 @@ def _fetch_from_exchange(exchange: ccxt.Exchange, asset: str, interval: str, lim
 
     logger.debug("%s request: %s %s limit=%d", name, symbol, tf, limit)
     try:
-        markets = exchange.load_markets()
+        with _CCXT_LOCK:
+            markets = exchange.load_markets()
     except Exception as exc:
         raise PriceFeedError(f"{name}: failed to load markets — {exc}") from exc
 
