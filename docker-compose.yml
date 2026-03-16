@@ -4,19 +4,14 @@ services:
     image: polymarket-hedge-bot:latest
     container_name: polymarket-hedge-bot
     restart: unless-stopped
-    ports:
-      - "8501:8501"
     env_file:
       - .env
     volumes:
-      # Persist trade data and logs outside the container
       - ./data:/app/data
       - ./logs:/app/logs
-      # Live-reload config without rebuilding (writable — UI saves config here)
       - ./config:/app/config
     environment:
       - PYTHONUNBUFFERED=1
-    # Prevent the private key from being exposed in inspect output
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
