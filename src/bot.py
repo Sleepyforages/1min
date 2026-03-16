@@ -174,9 +174,11 @@ class Bot:
             if len(df) < 1:
                 return None
             current = df.iloc[-1]  # current open bar (read at ~4:30 into window)
-            direction = "up" if current["close"] > current["open"] else "down"
-            logger.debug("  Direction signal %s: %s (close=%.4f open=%.4f) [current bar]",
-                         asset, direction, current["close"], current["open"])
+            raw_dir = "up" if current["close"] > current["open"] else "down"
+            direction = ("down" if raw_dir == "up" else "up") if cfg.invert_signal else raw_dir
+            mode_label = "mean-reversion" if cfg.invert_signal else "momentum"
+            logger.debug("  Direction signal %s: %s [%s] (close=%.4f open=%.4f)",
+                         asset, direction, mode_label, current["close"], current["open"])
             return direction
         except Exception as exc:
             logger.warning("  Direction fetch failed for %s: %s — skipping", asset, exc)

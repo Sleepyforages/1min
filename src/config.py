@@ -37,6 +37,7 @@ class Config:
     # Bet sizing
     base_bet_usd: float = 1.0
     entry_price: float = 0.51       # Fixed entry price for all orders (0 = use live market price)
+    invert_signal: bool = False     # True = mean reversion (bet against current bar direction)
 
     # Progression
     progression_type: ProgressionType = "fixed"
