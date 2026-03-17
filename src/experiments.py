@@ -180,45 +180,119 @@ def run_experiment_2(
     states: Dict[str, AssetState],
 ) -> None:
     """
-    Buy both sides pre-market at $0.51. Sell the losing side after 2 minutes.
+    Buy both sides pre-market at $0.51.
+    Sell the losing side with 3-attempt repricing loop:
+      T+2min  GTC sell at current last-trade price
+      T+3min  if unfilled: cancel → GTC sell at new price
+      T+4min  if unfilled: cancel → IOC sell at new price (final, fill or die)
     """
     for mkt in next_markets:
         up_oid,   up_matched   = place_side(executor, mkt, "up",   cfg.base_bet_usd, EXP2_PRICE)
         down_oid, down_matched = place_side(executor, mkt, "down", cfg.base_bet_usd, EXP2_PRICE)
 
-        logger.info("[exp2] %s — both sides placed, sell-loser in 120s", mkt.asset)
+        logger.info("[exp2] %s — both sides placed, sell-loser loop starting", mkt.asset)
         threading.Timer(
             120,
-            _sell_loser_exp2,
+            _sell_attempt_1,
             args=(executor, mkt, up_oid, up_matched, down_oid, down_matched),
         ).start()
 
 
-def _sell_loser_exp2(executor, mkt, up_oid, up_matched, down_oid, down_matched):
-    """Called 2 min into window. Sells the lower-priced (losing) side."""
+def _pick_loser(executor, mkt, up_oid, up_matched, down_oid, down_matched):
+    """
+    Determine the losing side at current prices.
+    Returns (loser_side, loser_token, buy_filled, up_p, down_p) or None if buy not filled.
+    """
     up_p   = fetch_last_trade(mkt.up_token_id)
     down_p = fetch_last_trade(mkt.down_token_id)
-    logger.info("[exp2] Sell-loser check %s  up=%.3f  down=%.3f", mkt.asset, up_p, down_p)
+    logger.info("[exp2] %s  up=%.3f  down=%.3f", mkt.asset, up_p, down_p)
 
     if up_p <= down_p:
         loser_side, loser_token, loser_oid, loser_matched = "up",   mkt.up_token_id,   up_oid,   up_matched
     else:
         loser_side, loser_token, loser_oid, loser_matched = "down", mkt.down_token_id, down_oid, down_matched
 
-    if executor.cfg.mode != "paper":
+    if executor.cfg.mode == "live" and executor.live:
         filled = loser_matched or check_order_filled(loser_oid, executor.live.client)
         if not filled:
-            logger.info("[exp2] %s/%s — not filled, nothing to sell", mkt.asset, loser_side)
+            logger.info("[exp2] %s/%s buy not filled — nothing to sell", mkt.asset, loser_side)
+            return None
+
+    return loser_side, loser_token, up_p, down_p
+
+
+def _place_sell(executor, asset: str, side: str, token_id: str,
+                price: float, order_type: str) -> str:
+    """
+    Place a sell order. order_type: "GTC" | "IOC".
+    Returns order_id or "" on failure.
+    """
+    if executor.cfg.mode == "paper":
+        logger.info("[paper] sell %s/%s @ %.3f  [%s]", asset, side, price, order_type)
+        return f"paper_sell_{asset}_{side}"
+    try:
+        from py_clob_client.clob_types import OrderArgs, OrderType as OT
+        ot = OT.GTC if order_type == "GTC" else OT.FOK   # py-clob-client uses FOK for IOC behaviour
+        order_args = OrderArgs(token_id=token_id, price=price, size=MIN_SHARES, side="SELL")
+        signed = executor.live.client.create_order(order_args)
+        resp   = executor.live.client.post_order(signed, ot)
+        oid    = resp.get("orderID", "unknown")
+        logger.info("[exp2] sell %s/%s  id=%s…  price=%.3f  [%s]",
+                    asset, side, oid[:16], price, order_type)
+        return oid
+    except Exception as exc:
+        logger.error("[exp2] sell failed %s/%s: %s", asset, side, exc)
+        return ""
+
+
+def _sell_attempt_1(executor, mkt, up_oid, up_matched, down_oid, down_matched):
+    """T+2min — GTC sell at current last-trade price."""
+    result = _pick_loser(executor, mkt, up_oid, up_matched, down_oid, down_matched)
+    if result is None:
+        return
+
+    loser_side, loser_token, up_p, down_p = result
+    sell_price = round(min(up_p, down_p), 3)
+    sell_oid = _place_sell(executor, mkt.asset, loser_side, loser_token, sell_price, "GTC")
+
+    # Pass sell state forward to attempt 2
+    sell_state = {"order_id": sell_oid, "loser_side": loser_side, "loser_token": loser_token}
+    threading.Timer(60, _sell_attempt_2, args=(executor, mkt, sell_state)).start()
+
+
+def _sell_attempt_2(executor, mkt, sell_state: dict):
+    """T+3min — if still open: cancel, repost GTC at fresh price."""
+    order_id = sell_state.get("order_id", "")
+
+    if executor.cfg.mode == "live" and executor.live and order_id:
+        if check_order_filled(order_id, executor.live.client):
+            logger.info("[exp2] %s — sell filled at attempt 1", mkt.asset)
             return
-        sell_price = round(min(up_p, down_p), 2)
-        try:
-            executor.live.place_limit_sell(loser_token, MIN_SHARES, sell_price)
-            logger.info("[exp2] %s — sold %s @ %.3f", mkt.asset, loser_side, sell_price)
-        except Exception as exc:
-            logger.error("[exp2] Sell failed %s/%s: %s", mkt.asset, loser_side, exc)
-    else:
-        logger.info("[exp2] [paper] Would sell %s/%s @ %.3f",
-                    mkt.asset, loser_side, min(up_p, down_p))
+        executor.live.cancel_order(order_id)
+
+    loser_token = sell_state["loser_token"]
+    loser_side  = sell_state["loser_side"]
+    new_price   = round(fetch_last_trade(loser_token), 3)
+    sell_oid    = _place_sell(executor, mkt.asset, loser_side, loser_token, new_price, "GTC")
+
+    sell_state["order_id"] = sell_oid
+    threading.Timer(60, _sell_attempt_3, args=(executor, mkt, sell_state)).start()
+
+
+def _sell_attempt_3(executor, mkt, sell_state: dict):
+    """T+4min — if still open: cancel, repost IOC at fresh price (final attempt)."""
+    order_id = sell_state.get("order_id", "")
+
+    if executor.cfg.mode == "live" and executor.live and order_id:
+        if check_order_filled(order_id, executor.live.client):
+            logger.info("[exp2] %s — sell filled at attempt 2", mkt.asset)
+            return
+        executor.live.cancel_order(order_id)
+
+    loser_token = sell_state["loser_token"]
+    loser_side  = sell_state["loser_side"]
+    new_price   = round(fetch_last_trade(loser_token), 3)
+    _place_sell(executor, mkt.asset, loser_side, loser_token, new_price, "IOC")
 
 
 # ── experiment_3 ────────────────────────────────────────────────────────────────
