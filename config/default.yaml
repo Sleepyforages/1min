@@ -2,7 +2,7 @@
 # Follow the winner: check closing window price >= 0.80, buy that side for next window.
 # One asset only (SOL) for mechanical verification.
 
-mode: live
+mode: paper
 interval: 5m
 assets:
   - sol

@@ -192,10 +192,18 @@ class Bot:
         if check_ts > now_ts:
             time.sleep(check_ts - now_ts)
 
-        # T-15s: check current window prices (prev_exp_markets = last cycle's next_markets)
+        # T-15s: discover the CURRENT (closing) window and check prices
+        # window_offset=0 returns the live window that closes at next_boundary
         winners = {}
-        if self._prev_exp_markets and cfg.experiment in ("experiment_1", "experiment_3"):
-            winners = check_markets_prices(self._prev_exp_markets)
+        if cfg.experiment in ("experiment_1", "experiment_3"):
+            current_markets = discover_markets(
+                interval=cfg.interval,
+                assets=cfg.assets,
+                skip_clob_check=(cfg.weekend_behavior == "off"),
+                window_offset=0,
+            )
+            if current_markets:
+                winners = check_markets_prices(current_markets)
 
         # Sleep until T-10s for order placement
         now_ts = int(time.time())
