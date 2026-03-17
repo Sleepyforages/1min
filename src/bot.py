@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 from .alerts import alert_bot_started, alert_daily_limit, alert_drawdown, alert_redemption, alert_trade_loss, alert_trade_win
 from .config import Config, load_config
 from .executor import Executor
+from .experiments import AssetState, check_markets_prices, run_experiment_1, run_experiment_2, run_experiment_3
 from .market_discovery import PolyMarket, discover_markets, enrich_with_prices
 from .strategy import ProgressionState, TradeSignal, generate_signal
 
@@ -41,6 +42,9 @@ class Bot:
         self._last_reset_day: Optional[int] = None
         self._lock = threading.Lock()
         self._cycle_count: int = 0
+        # Experiment state
+        self._exp_states: Dict[str, AssetState] = {}
+        self._prev_exp_markets: List[PolyMarket] = []
 
     def run(self):
         self._running = True
@@ -70,7 +74,10 @@ class Bot:
                 logger.debug("Hot-reloading config …")
                 self.cfg = load_config()
                 self._maybe_reset_daily_pnl()
-                self._run_cycle()
+                if self.cfg.experiment != "off":
+                    self._run_experiment_cycle()
+                else:
+                    self._run_cycle()
                 self._cycle_count += 1
                 # Auto-redeem every 2 cycles (~10 min at 5m interval)
                 if self.cfg.mode == "live" and self._cycle_count % 2 == 0:
@@ -79,8 +86,6 @@ class Bot:
                 logger.exception("Unhandled cycle error: %s", exc)
 
             # Sleep until 30s BEFORE the next window boundary.
-            # At that point the current bar has 30 seconds left — enough to read
-            # its live direction and place a pre-market order on the next window.
             interval_secs = INTERVAL_SECONDS.get(self.cfg.interval, 300)
             now_ts = int(time.time())
             next_boundary = ((now_ts + interval_secs) // interval_secs) * interval_secs
@@ -146,6 +151,74 @@ class Bot:
             dd = self._current_drawdown_pct()
             logger.info("Daily P&L: $%.2f  |  Drawdown: %.1f%%", self.executor.daily_pnl, dd)
             alert_drawdown(dd, cfg)
+
+    # ── Experiment cycle ───────────────────────────────────────────────────────
+
+    def _run_experiment_cycle(self):
+        """
+        Timing-precise cycle for experiments.
+
+          T - 30s  (outer loop wakes here)
+          T - 15s  check last-trade prices of current window → determine winner
+          T - 10s  place pre-market orders for next window
+          T + 0s   window closes, orders already resting
+        """
+        cfg = self.cfg
+        self.executor.cfg = cfg
+
+        interval_secs = INTERVAL_SECONDS.get(cfg.interval, 300)
+        now_ts = int(time.time())
+        next_boundary = ((now_ts + interval_secs) // interval_secs) * interval_secs
+
+        logger.info("━" * 60)
+        logger.info("EXPERIMENT CYCLE  [%s]  %s",
+                    cfg.experiment, datetime.now(timezone.utc).isoformat())
+        logger.info("━" * 60)
+
+        # Discover next window's markets (for order placement at T-10s)
+        next_markets = discover_markets(
+            interval=cfg.interval,
+            assets=cfg.assets,
+            skip_clob_check=(cfg.weekend_behavior == "off"),
+            window_offset=1,
+        )
+        if not next_markets:
+            logger.warning("[exp] No next-window markets found — skipping cycle")
+            return
+
+        # Sleep until T-15s for price check
+        now_ts = int(time.time())
+        check_ts = next_boundary - 15
+        if check_ts > now_ts:
+            time.sleep(check_ts - now_ts)
+
+        # T-15s: check current window prices (prev_exp_markets = last cycle's next_markets)
+        winners = {}
+        if self._prev_exp_markets and cfg.experiment in ("experiment_1", "experiment_3"):
+            winners = check_markets_prices(self._prev_exp_markets)
+
+        # Sleep until T-10s for order placement
+        now_ts = int(time.time())
+        order_ts = next_boundary - 10
+        if order_ts > now_ts:
+            time.sleep(order_ts - now_ts)
+
+        # T-10s: place pre-market orders
+        if cfg.experiment == "experiment_1":
+            run_experiment_1(cfg, self.executor, self._prev_exp_markets,
+                             next_markets, self._exp_states, winners)
+        elif cfg.experiment == "experiment_2":
+            run_experiment_2(cfg, self.executor, next_markets, self._exp_states)
+        elif cfg.experiment == "experiment_3":
+            run_experiment_3(cfg, self.executor, self._prev_exp_markets,
+                             next_markets, self._exp_states, winners)
+        else:
+            logger.warning("[exp] Unknown experiment '%s'", cfg.experiment)
+
+        # Save this cycle's next_markets — they become prev_markets next cycle
+        self._prev_exp_markets = next_markets
+
+    # ── Standard cycle ─────────────────────────────────────────────────────────
 
     def _run_assets_parallel(self, cfg: Config, market_index: Dict[str, PolyMarket]):
         """Spawn one thread per asset; join all before returning."""

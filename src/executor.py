@@ -195,9 +195,10 @@ class LiveExecutor:
         signed_order = self.client.create_order(order_args)
         resp = self.client.post_order(signed_order, OrderType.GTC)
         order_id = resp.get("orderID", "unknown")
+        is_matched = resp.get("status", "") == "matched"
         logger.info("Limit buy placed: %s  size=%.4f shares  price=%.3f  response=%s",
                     order_id, size, price, resp)
-        return order_id, price
+        return order_id, price, is_matched
 
     def place_limit_sell(self, token_id: str, token_size: float, price: float) -> str:
         """
@@ -351,7 +352,7 @@ class Executor:
         if self.cfg.mode == "paper":
             self.paper.place_order(order)
         else:
-            order.order_id, actual_price = self.live.place_limit_buy(token_id, size_usd, price)
+            order.order_id, actual_price, _ = self.live.place_limit_buy(token_id, size_usd, price)
             order.fill_price = actual_price if actual_price > 0 else (price if price > 0 else 0.5)
             order.token_size = size_usd / order.fill_price if order.fill_price > 0 else 0.0
             order.filled = True

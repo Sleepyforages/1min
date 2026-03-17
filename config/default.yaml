@@ -8,6 +8,7 @@ interval: 5m
 assets:
   - sol
   - doge
+experiment: experiment_1   # experiment_1 | experiment_2 | experiment_3 | off
 
 # ── Bet Sizing ─────────────────────────────────────────────────────────────────
 base_bet_usd: 1.0

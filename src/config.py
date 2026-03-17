@@ -88,6 +88,9 @@ class Config:
     dry_run: bool = False
     max_daily_loss_pct: float = 10.0
 
+    # Experiment mode
+    experiment: str = "off"   # "off" | "experiment_1" | "experiment_2" | "experiment_3"
+
     # Logging
     log_level: str = "INFO"
 
