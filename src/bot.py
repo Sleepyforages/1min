@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 from .alerts import alert_bot_started, alert_daily_limit, alert_drawdown, alert_redemption, alert_trade_loss, alert_trade_win
 from .config import Config, load_config
 from .executor import Executor
-from .experiments import AssetState, check_markets_prices, run_experiment_1, run_experiment_2, run_experiment_3
+from .experiments import AssetState, check_markets_prices, run_experiment_1, run_experiment_2, run_experiment_3, run_experiment_4
 from .market_discovery import PolyMarket, discover_markets, enrich_with_prices
 from .strategy import ProgressionState, TradeSignal, generate_signal
 
@@ -205,13 +205,15 @@ class Bot:
             if current_markets:
                 winners = check_markets_prices(current_markets)
 
-        # Sleep until T-10s for order placement
-        now_ts = int(time.time())
-        order_ts = next_boundary - 10
+        # Sleep until order placement time:
+        #   experiment_4 → T=0 (window open, IOC into live market)
+        #   all others   → T-10s (pre-market GTC)
+        now_ts   = int(time.time())
+        order_ts = next_boundary if cfg.experiment == "experiment_4" else next_boundary - 10
         if order_ts > now_ts:
             time.sleep(order_ts - now_ts)
 
-        # T-10s: place pre-market orders
+        # Place orders
         if cfg.experiment == "experiment_1":
             run_experiment_1(cfg, self.executor, self._prev_exp_markets,
                              next_markets, self._exp_states, winners)
@@ -220,6 +222,8 @@ class Bot:
         elif cfg.experiment == "experiment_3":
             run_experiment_3(cfg, self.executor, self._prev_exp_markets,
                              next_markets, self._exp_states, winners)
+        elif cfg.experiment == "experiment_4":
+            run_experiment_4(cfg, self.executor, next_markets, self._exp_states, winners)
         else:
             logger.warning("[exp] Unknown experiment '%s'", cfg.experiment)
 

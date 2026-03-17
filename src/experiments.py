@@ -31,7 +31,7 @@ MIN_SHARES        = 5.0    # Polymarket minimum
 
 @dataclass
 class AssetState:
-    """State persisted across cycles per asset (used by experiment_3)."""
+    """State persisted across cycles per asset (used by experiment_3 and experiment_4)."""
     # Tokens from the previous cycle (to check prices at next T-15s)
     prev_up_token_id:   str  = ""
     prev_down_token_id: str  = ""
@@ -41,9 +41,11 @@ class AssetState:
     # Whether each order was immediately matched at placement time
     prev_up_matched:    bool = False
     prev_down_matched:  bool = False
-    # Martingale state
+    # Martingale state (experiment_3)
     martingale_side:       Optional[str] = None  # "up" | "down" | None
     martingale_multiplier: float         = 1.0
+    # experiment_4 state
+    current_side: str = "up"   # default first bet is UP
 
 
 # ── Price utilities ──────────────────────────────────────────────────────────────
@@ -375,3 +377,90 @@ def run_experiment_3(
 def _reset_martingale(state: AssetState) -> None:
     state.martingale_side       = None
     state.martingale_multiplier = 1.0
+
+
+# ── experiment_4 ────────────────────────────────────────────────────────────────
+
+def place_side_ioc(
+    executor,
+    market,
+    side: str,
+    size_usd: float,
+    price: float,
+) -> Tuple[str, bool]:
+    """
+    Place an IOC (immediate-or-cancel) buy order.
+    Returns (order_id, is_filled).
+    """
+    token_id = market.up_token_id if side == "up" else market.down_token_id
+
+    if executor.cfg.mode == "paper":
+        oid = f"paper_{market.asset}_{side}_{int(time.time())}_ioc"
+        logger.info("[paper] IOC %s/%s @ %.3f  $%.2f", market.asset, side, price, size_usd)
+        return oid, True
+
+    try:
+        import math
+        from py_clob_client.clob_types import OrderArgs, OrderType as OT
+        raw_shares = size_usd / price if price > 0 else MIN_SHARES
+        size = max(MIN_SHARES, math.ceil(raw_shares * 1e6) / 1e6)
+        order_args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
+        signed = executor.live.client.create_order(order_args)
+        resp   = executor.live.client.post_order(signed, OT.FOK)
+        oid    = resp.get("orderID", "unknown")
+        filled = resp.get("status", "") == "matched"
+        logger.info("[exp4] IOC %s/%s  id=%s…  filled=%s  price=%.3f",
+                    market.asset, side, oid[:16], filled, price)
+        return oid, filled
+    except Exception as exc:
+        logger.error("[exp4] IOC failed %s/%s: %s", market.asset, side, exc)
+        return "", False
+
+
+def run_experiment_4(
+    cfg,
+    executor,
+    next_markets,
+    states: Dict[str, AssetState],
+    winners: Dict[str, Optional[str]],
+) -> None:
+    """
+    IOC order at window open on the just-resolved winner.
+
+    Timing (managed by bot._run_experiment_cycle):
+      T-15s  check closing window → determine winner → update current_side
+      T+0s   place IOC on current_side at window open
+
+    First cycle default: current_side = "up".
+    Price = last-trade of the winning token + 0.03 buffer (capped at 0.95).
+    """
+    next_map = {m.asset: m for m in next_markets}
+
+    for raw_asset in cfg.assets:
+        asset    = raw_asset.lower()
+        state    = states.setdefault(asset, AssetState())
+        next_mkt = next_map.get(asset)
+
+        if not next_mkt:
+            logger.warning("[exp4] %s — no next market", asset)
+            continue
+
+        # Update side from last window's winner (if confirmed)
+        winner = winners.get(asset)
+        if winner:
+            prev_side    = state.current_side
+            state.current_side = winner
+            logger.info("[exp4] %s — last winner=%s  (was betting %s) → now betting %s",
+                        asset, winner, prev_side, state.current_side)
+        else:
+            logger.info("[exp4] %s — no clear winner last window, keeping side=%s",
+                        asset, state.current_side)
+
+        # Fetch live price for IOC; add buffer so it fills
+        token_id  = next_mkt.up_token_id if state.current_side == "up" else next_mkt.down_token_id
+        raw_price = fetch_last_trade(token_id)
+        price     = round(min(raw_price + 0.03, 0.95), 3)
+
+        logger.info("[exp4] %s — placing IOC %s @ %.3f  $%.2f",
+                    asset, state.current_side, price, cfg.base_bet_usd)
+        place_side_ioc(executor, next_mkt, state.current_side, cfg.base_bet_usd, price)

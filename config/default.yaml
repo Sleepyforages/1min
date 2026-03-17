@@ -1,12 +1,12 @@
-# ── EXPERIMENT: experiment_1 — single asset smoke test (2026-03-17) ─────────────
-# Follow the winner: check closing window price >= 0.80, buy that side for next window.
-# One asset only (SOL) for mechanical verification.
+# ── EXPERIMENT: experiment_4 — IOC at window open, follow last winner (2026-03-17) ─
+# At T-15s: check closing window winner. At T=0: IOC on winner's side.
+# Default first bet: UP. One asset only (SOL), paper mode.
 
 mode: paper
 interval: 5m
 assets:
   - sol
-experiment: experiment_1   # experiment_1 | experiment_2 | experiment_3 | off
+experiment: experiment_4   # experiment_1 | experiment_2 | experiment_3 | experiment_4 | off
 
 # ── Bet Sizing ─────────────────────────────────────────────────────────────────
 base_bet_usd: 1.0
