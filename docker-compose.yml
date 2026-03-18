@@ -12,8 +12,8 @@ services:
       - ./config:/app/config
     environment:
       - PYTHONUNBUFFERED=1
-      - HTTPS_PROXY=socks5h://172.17.0.1:9050
-      - HTTP_PROXY=socks5h://172.17.0.1:9050
+      - HTTPS_PROXY=socks5h://172.18.0.1:9050
+      - HTTP_PROXY=socks5h://172.18.0.1:9050
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
