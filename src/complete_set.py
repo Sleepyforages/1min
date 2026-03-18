@@ -159,6 +159,9 @@ class CompleteSetEngine:
         """Main loop. Blocks until _running=False."""
         self._running = True
         logger.info("[cs] CompleteSetEngine starting  refresh=%ds", REFRESH_SECS)
+        # Give the rate-limiter a chance to reset before the first order attempt
+        logger.info("[cs] startup warmup 60s — waiting before first order attempt")
+        self._rate_limited_until = time.time() + 60
 
         while self._running:
             try:
@@ -331,8 +334,8 @@ class CompleteSetEngine:
             return order_id
         except Exception as exc:
             if "429" in str(exc):
-                self._rate_limited_until = time.time() + 300
-                logger.warning("[cs] 429 rate-limit — backing off 300s  %s/%s",
+                self._rate_limited_until = time.time() + 600
+                logger.warning("[cs] 429 rate-limit — backing off 600s  %s/%s",
                                mkt.asset, side)
             else:
                 logger.error("[cs] place failed %s/%s: %s", mkt.asset, side, exc)
