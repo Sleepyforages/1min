@@ -256,12 +256,19 @@ class CompleteSetEngine:
         logger.info("[cs] %s  quote_up=%.3f  quote_dn=%.3f  size=%.0f shares  imbalance=%.0f",
                     mkt.asset, price_up, price_dn, size, imbalance)
 
+        # Track whether UP was just placed this tick
+        up_had_order = bool(state.up_order_id)
         # Manage UP order
         self._manage_order(mkt, state, "up", mkt.up_token_id,
                            price_up, size_usd_up, price_up)
-        # Small gap between UP and DN placements helps stay under rate limit.
-        if not state.dn_order_id and state.up_order_id:
-            time.sleep(5)
+        up_just_placed = not up_had_order and bool(state.up_order_id)
+
+        # Rate limit: CLOB allows ~1 order per 30s.
+        # If UP was just placed this tick, defer DN to the next tick.
+        if up_just_placed:
+            logger.info("[cs] %s UP just placed — deferring DN to next tick", mkt.asset)
+            return
+
         # Manage DOWN order
         self._manage_order(mkt, state, "dn", mkt.down_token_id,
                            price_dn, size_usd_dn, price_dn)
