@@ -255,6 +255,10 @@ class CompleteSetEngine:
         # Manage UP order
         self._manage_order(mkt, state, "up", mkt.up_token_id,
                            price_up, size_usd_up, price_up)
+        # Brief pause — Cloudflare rate-limits back-to-back POSTs; only needed
+        # when the DN order still needs to be placed.
+        if not state.dn_order_id:
+            time.sleep(5)
         # Manage DOWN order
         self._manage_order(mkt, state, "dn", mkt.down_token_id,
                            price_dn, size_usd_dn, price_dn)
