@@ -153,6 +153,7 @@ class CompleteSetEngine:
         self.executor = executor
         self._states:  Dict[str, MarketState] = {}  # market_id → state
         self._running = False
+        self._rate_limited_until: float = 0.0  # backoff timestamp after 429
 
     def run_forever(self):
         """Main loop. Blocks until _running=False."""
@@ -255,10 +256,9 @@ class CompleteSetEngine:
         # Manage UP order
         self._manage_order(mkt, state, "up", mkt.up_token_id,
                            price_up, size_usd_up, price_up)
-        # Cloudflare rate-limits POST /order to ~1 per 30s per IP.
-        # If DN not yet placed, wait a full cycle before trying.
-        if not state.dn_order_id:
-            time.sleep(30)
+        # Small gap between UP and DN placements helps stay under rate limit.
+        if not state.dn_order_id and state.up_order_id:
+            time.sleep(5)
         # Manage DOWN order
         self._manage_order(mkt, state, "dn", mkt.down_token_id,
                            price_dn, size_usd_dn, price_dn)
@@ -317,13 +317,25 @@ class CompleteSetEngine:
                     mkt_state.inv_dn += round(size_usd / price, 2)
             return oid
 
+        # Honour rate-limit backoff
+        wait = self._rate_limited_until - time.time()
+        if wait > 0:
+            logger.info("[cs] rate-limited — skipping %s/%s  (%.0fs remaining)",
+                        mkt.asset, side, wait)
+            return ""
+
         try:
             order_id, _, _ = self.executor.live.place_limit_buy(token_id, size_usd, price)
             logger.info("[cs] GTC BUY %s/%s  id=%s…  @ %.3f  $%.2f",
                         mkt.asset, side, order_id[:16], price, size_usd)
             return order_id
         except Exception as exc:
-            logger.error("[cs] place failed %s/%s: %s", mkt.asset, side, exc)
+            if "429" in str(exc):
+                self._rate_limited_until = time.time() + 120
+                logger.warning("[cs] 429 rate-limit — backing off 120s  %s/%s",
+                               mkt.asset, side)
+            else:
+                logger.error("[cs] place failed %s/%s: %s", mkt.asset, side, exc)
             return ""
 
     def _cancel_order(self, mkt, state: MarketState, side: str):
