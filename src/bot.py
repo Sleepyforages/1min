@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 from .alerts import alert_bot_started, alert_daily_limit, alert_drawdown, alert_redemption, alert_trade_loss, alert_trade_win
 from .config import Config, load_config
 from .executor import Executor
+from .complete_set import CompleteSetEngine
 from .experiments import AssetState, check_markets_prices, run_experiment_1, run_experiment_2, run_experiment_3, run_experiment_4
 from .market_discovery import PolyMarket, discover_markets, enrich_with_prices
 from .strategy import ProgressionState, TradeSignal, generate_signal
@@ -69,6 +70,11 @@ class Bot:
         if self.cfg.mode == "live" and not self.cfg.dry_run:
             self._live_preflight()
 
+        # complete_set runs its own blocking loop
+        if self.cfg.experiment == "complete_set":
+            self._run_complete_set()
+            return
+
         while self._running:
             try:
                 logger.debug("Hot-reloading config …")
@@ -99,6 +105,28 @@ class Bot:
                 if not self._running:
                     break
                 time.sleep(1)
+
+    # ── Complete-set engine ───────────────────────────────────────────────────
+
+    def _run_complete_set(self):
+        """Launch the complete-set maker engine. Blocks until shutdown signal."""
+        logger.info("━" * 60)
+        logger.info("COMPLETE-SET ENGINE  mode=%s  assets=%s  interval=%s",
+                    self.cfg.mode, self.cfg.assets, self.cfg.interval)
+        logger.info("━" * 60)
+
+        engine = CompleteSetEngine(self.cfg, self.executor)
+
+        # Wire shutdown signal
+        import signal as _sig
+        def _stop(signum, frame):
+            logger.info("Shutdown — stopping complete-set engine")
+            engine.stop()
+            self._running = False
+        _sig.signal(_sig.SIGINT,  _stop)
+        _sig.signal(_sig.SIGTERM, _stop)
+
+        engine.run_forever()
 
     # ── Cycle ─────────────────────────────────────────────────────────────────
 

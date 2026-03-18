@@ -1,12 +1,14 @@
-# ── EXPERIMENT: experiment_4 — IOC at window open, follow last winner (2026-03-17) ─
-# At T-15s: check closing window winner. At T=0: IOC on winner's side.
-# Default first bet: UP. One asset only (SOL), paper mode.
+# ── COMPLETE-SET ARBITRAGE (2026-03-18) ──────────────────────────────────────
+# Maker GTC bids on BOTH sides when 1-(bid_up+bid_dn) >= 0.01.
+# Quotes at best_bid + 1 tick (never crosses spread).
+# Taker top-up lagging leg at T-60s.
+# Paper mode for initial verification.
 
 mode: paper
 interval: 5m
 assets:
   - sol
-experiment: experiment_4   # experiment_1 | experiment_2 | experiment_3 | experiment_4 | off
+experiment: complete_set   # experiment_1..4 | complete_set | off
 
 # ── Bet Sizing ─────────────────────────────────────────────────────────────────
 base_bet_usd: 1.0
