@@ -195,7 +195,7 @@ class CompleteSetEngine:
 
     def _tick_market(self, mkt):
         from datetime import datetime as DT
-        state = self._states.setdefault(mkt.market_id, MarketState())
+        state = self._states.setdefault(mkt.condition_id, MarketState())
         cfg   = self.cfg
 
         end_ts       = DT.fromisoformat(mkt.end_date_iso.replace("Z", "+00:00")).timestamp()
@@ -204,7 +204,7 @@ class CompleteSetEngine:
         # Market expired — cancel everything and clean up
         if seconds_left <= 0:
             self._cancel_market(mkt, state)
-            self._states.pop(mkt.market_id, None)
+            self._states.pop(mkt.condition_id, None)
             return
 
         # Fetch books for both legs
@@ -299,11 +299,11 @@ class CompleteSetEngine:
                         mkt.asset, side, price, size_usd)
             # Optimistic fill assumption for paper: mark as filled immediately
             if side == "up":
-                mkt_state = self._states.get(mkt.market_id)
+                mkt_state = self._states.get(mkt.condition_id)
                 if mkt_state:
                     mkt_state.inv_up += round(size_usd / price, 2)
             else:
-                mkt_state = self._states.get(mkt.market_id)
+                mkt_state = self._states.get(mkt.condition_id)
                 if mkt_state:
                     mkt_state.inv_dn += round(size_usd / price, 2)
             return oid
