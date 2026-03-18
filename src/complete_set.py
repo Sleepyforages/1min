@@ -331,8 +331,8 @@ class CompleteSetEngine:
             return order_id
         except Exception as exc:
             if "429" in str(exc):
-                self._rate_limited_until = time.time() + 120
-                logger.warning("[cs] 429 rate-limit — backing off 120s  %s/%s",
+                self._rate_limited_until = time.time() + 300
+                logger.warning("[cs] 429 rate-limit — backing off 300s  %s/%s",
                                mkt.asset, side)
             else:
                 logger.error("[cs] place failed %s/%s: %s", mkt.asset, side, exc)
