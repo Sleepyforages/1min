@@ -240,7 +240,12 @@ class CompleteSetEngine:
         price_up = maker_entry_price(best_bid_up, best_ask_up, IMPROVE_TICKS, skew_up)
         price_dn = maker_entry_price(best_bid_dn, best_ask_dn, IMPROVE_TICKS, skew_dn)
 
-        size = shares_for_5m(seconds_left)
+        # Cap per-side USD via base_bet_usd; min 5 shares (Polymarket floor)
+        max_usd = getattr(cfg, "base_bet_usd", 0) or 0
+        if max_usd > 0:
+            size = max(5.0, math.floor(max_usd / max(price_up, price_dn)))
+        else:
+            size = shares_for_5m(seconds_left)
         size_usd_up = round(price_up * size, 4)
         size_usd_dn = round(price_dn * size, 4)
 

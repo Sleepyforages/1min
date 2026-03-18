@@ -4,14 +4,14 @@
 # Taker top-up lagging leg at T-60s.
 # Paper mode for initial verification.
 
-mode: paper
+mode: live
 interval: 5m
 assets:
   - sol
 experiment: complete_set   # experiment_1..4 | complete_set | off
 
 # ── Bet Sizing ─────────────────────────────────────────────────────────────────
-base_bet_usd: 1.0
+base_bet_usd: 2.5
 entry_price: 0.51            # Fixed entry price ($0.51 GTC pre-market)
 invert_signal: true          # Mean reversion: bet AGAINST current bar direction
 
